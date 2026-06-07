@@ -1,0 +1,30 @@
+schedule:
+  hour: 9           # Local hour to send daily update (24hr)
+  timezone: "US/Eastern"
+
+garmin:
+  lookback_days: 7          # How many days of history to pull
+  activities_count: 7       # How many recent activities to include
+  metrics:                  # Toggle which data points to pull
+    sleep: true
+    hrv: true
+    body_battery: true
+    steps: false
+    stress: true
+    activities: true
+
+claude:
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 2000
+  daily_update:
+    max_sentences: 4        # Max length of morning summary
+    tone: "direct"          # direct | encouraging | detailed
+  coach_notes:
+    max_lines: 10           # Max notes to keep at once
+    expiry_days: 14         # Auto-remove notes older than this
+
+coaching:
+  sport: "running"          # running | cycling | triathlon | general
+  units: "imperial"         # imperial | metric
+  focus: "Follow training"    # Informs Claude's recommendations — free text
+  goal: "Late october 5k"   # Current goal — free text

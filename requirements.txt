@@ -1,0 +1,6 @@
+garminconnect
+anthropic
+python-telegram-bot
+python-dotenv
+httpx
+pyyaml

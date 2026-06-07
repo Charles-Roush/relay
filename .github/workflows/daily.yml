@@ -1,0 +1,39 @@
+name: Daily Training Update
+
+on:
+  schedule:
+    - cron: "0 14 * * *"  # 9am US/Eastern (UTC-5). Adjust for DST as needed.
+  workflow_dispatch:        # Allow manual runs
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily update
+        env:
+          GARMIN_EMAIL: ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD: ${{ secrets.GARMIN_PASSWORD }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python relay.py
+
+      - name: Commit updated notes and plan
+        run: |
+          git config user.name "relay-bot"
+          git config user.email "relay-bot@users.noreply.github.com"
+          git add coach_notes.md training_plan.md
+          git diff --cached --quiet || git commit -m "daily: update coach notes and training plan"
+          git push
