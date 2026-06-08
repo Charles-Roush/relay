@@ -3,9 +3,9 @@ schedule:
   timezone: "US/Eastern"
 
 garmin:
-  lookback_days: 7          # How many days of history to pull
-  activities_count: 7       # How many recent activities to include
-  metrics:                  # Toggle which data points to pull
+  lookback_days: 10          # How many days of history to pull
+  activities_count: 10       # How many recent activities to include
+  metrics:                   # Toggle which data points to pull
     sleep: true
     hrv: true
     body_battery: true
@@ -14,17 +14,17 @@ garmin:
     activities: true
 
 claude:
-  model: "claude-haiku-4-5-20251001"
-  max_tokens: 2000
+  model: "claude-sonnet-4-6"
+  max_tokens: 4000
   daily_update:
-    max_sentences: 4        # Max length of morning summary
-    tone: "direct"          # direct | encouraging | detailed
+    max_sentences: 10        # Max length of morning summary
+    tone: "direct"           # direct | encouraging | detailed
   coach_notes:
-    max_lines: 10           # Max notes to keep at once
-    expiry_days: 14         # Auto-remove notes older than this
+    max_lines: 20            # Max notes to keep at once
+    expiry_days: 21          # Auto-remove notes older than this
 
 coaching:
-  sport: "running"          # running | cycling | triathlon | general
-  units: "imperial"         # imperial | metric
-  focus: "Follow training"    # Informs Claude's recommendations — free text
-  goal: "Late october 5k"   # Current goal — free text
+  sport: "running"           # running | cycling | triathlon | general
+  units: "imperial"          # imperial | metric
+  focus: "Follow training"   # Informs Claude's recommendations — free text
+  goal: "Late october 5k"    # Current goal — free text

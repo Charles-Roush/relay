@@ -1,3 +1,4 @@
+import re
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -5,14 +6,35 @@ import yaml
 
 NOTES_FILE = Path("coach_notes.md")
 PLAN_FILE = Path("training_plan.md")
+PROFILE_FILE = Path("athlete_profile.md")
 
 NOTES_HEADER = "## Coach Notes\n\n"
 PLAN_HEADER = "## Training Plan\n\n"
+PROFILE_TEMPLATE = """\
+## Athlete Profile
+
+### Personal Records
+_No PRs logged yet._
+
+### Injury History
+_No injuries logged._
+
+### Training Observations
+_Claude will build observations here over time — pacing tendencies, recovery patterns, response to load, strengths and weaknesses._
+
+### Goals & Context
+_Updated by Claude as goals evolve._
+"""
+
+_config: dict | None = None
 
 
-def load_config():
-    with open("config.yaml") as f:
-        return yaml.safe_load(f)
+def load_config() -> dict:
+    global _config
+    if _config is None:
+        with open("config.yaml") as f:
+            _config = yaml.safe_load(f)
+    return _config
 
 
 def read_notes() -> str:
@@ -27,6 +49,22 @@ def read_plan() -> str:
     return PLAN_FILE.read_text()
 
 
+def read_profile() -> str:
+    if not PROFILE_FILE.exists():
+        PROFILE_FILE.write_text(PROFILE_TEMPLATE)
+    return PROFILE_FILE.read_text()
+
+
+def write_profile(content: str):
+    PROFILE_FILE.write_text(content if content.endswith("\n") else content + "\n")
+
+
+def append_to_profile(text: str):
+    """Append a raw line to the profile (used for PR logging etc.)."""
+    content = read_profile().rstrip()
+    PROFILE_FILE.write_text(content + "\n" + text + "\n")
+
+
 def write_notes(content: str):
     """Write notes, enforcing expiry and max_lines from config."""
     config = load_config()
@@ -36,7 +74,6 @@ def write_notes(content: str):
 
     cutoff = date.today() - timedelta(days=expiry_days)
 
-    # Extract lines that look like note entries vs header lines
     lines = content.splitlines()
     header_lines = []
     note_lines = []
@@ -51,23 +88,20 @@ def write_notes(content: str):
         elif not in_notes:
             header_lines.append(line)
 
-    # Filter expired notes
+    date_pattern = re.compile(r'^\[(\d{4}-\d{2}-\d{2})\]')
     filtered = []
     for line in note_lines:
-        # Try to extract date from [YYYY-MM-DD] prefix
-        if line.startswith("[") and "]" in line:
-            date_str = line[1:11]
+        m = date_pattern.match(line)
+        if m:
             try:
-                note_date = date.fromisoformat(date_str)
+                note_date = date.fromisoformat(m.group(1))
                 if note_date >= cutoff:
                     filtered.append(line)
-                # else: expired, drop it
             except ValueError:
-                filtered.append(line)  # can't parse date, keep it
+                filtered.append(line)
         else:
             filtered.append(line)
 
-    # Trim to max_lines (keep most recent = last N)
     if len(filtered) > max_lines:
         filtered = filtered[-max_lines:]
 
@@ -75,34 +109,40 @@ def write_notes(content: str):
     NOTES_FILE.write_text(rebuilt)
 
 
-def write_plan(content: str):
-    PLAN_FILE.write_text(content if content.endswith("\n") else content + "\n")
+def append_feedback_note(text: str):
+    """Directly append a timestamped feedback entry to coach_notes without Claude."""
+    today = date.today().isoformat()
+    entry = f"[{today}] [FEEDBACK] {text}"
+    content = read_notes()
+    lines = content.rstrip().splitlines()
+    lines.append(entry)
+    write_notes("\n".join(lines) + "\n")
 
 
-def parse_claude_response(response: str) -> tuple[str, str, str]:
+def parse_claude_response(response: str) -> tuple[str, str, str, str, str]:
     """
-    Returns (message, updated_notes, updated_plan).
-    Splits on UPDATED_NOTES: and UPDATED_PLAN: markers.
+    Parse XML-tagged Claude response.
+    Returns (message, updated_notes, updated_profile, updated_plan).
+    Falls back gracefully if tags are missing.
     """
-    message = response
-    updated_notes = ""
-    updated_plan = ""
+    msg_match = re.search(r'<coaching_message>(.*?)</coaching_message>', response, re.DOTALL)
+    notes_match = re.search(r'<updated_notes>(.*?)</updated_notes>', response, re.DOTALL)
+    profile_match = re.search(r'<updated_profile>(.*?)</updated_profile>', response, re.DOTALL)
+    plan_match = re.search(r'<updated_plan>(.*?)</updated_plan>', response, re.DOTALL)
+    feedback_match = re.search(r'<feedback_log>(.*?)</feedback_log>', response, re.DOTALL)
 
-    if "UPDATED_PLAN:" in response:
-        parts = response.split("UPDATED_PLAN:", 1)
-        updated_plan = parts[1].strip()
-        response = parts[0]
+    message = msg_match.group(1).strip() if msg_match else response.strip()
+    updated_notes = notes_match.group(1).strip() if notes_match else ""
+    updated_profile = profile_match.group(1).strip() if profile_match else ""
+    updated_plan = plan_match.group(1).strip() if plan_match else ""
+    feedback_log = feedback_match.group(1).strip() if feedback_match else ""
 
-    if "UPDATED_NOTES:" in response:
-        parts = response.split("UPDATED_NOTES:", 1)
-        updated_notes = parts[1].strip()
-        message = parts[0].strip()
-
-    return message, updated_notes, updated_plan
+    return message, updated_notes, updated_profile, updated_plan, feedback_log
 
 
-def apply_updates(updated_notes: str, updated_plan: str):
+def apply_updates(updated_notes: str, updated_profile: str):
     if updated_notes:
         write_notes(updated_notes)
-    if updated_plan:
-        write_plan(updated_plan)
+    if updated_profile:
+        write_profile(updated_profile)
+    # updated_plan is intentionally never applied — training_plan.md is read-only

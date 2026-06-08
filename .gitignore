@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.pyo
 .python-version
+logs/garmin_cache_*.json
+logs/*.md
+.claude
