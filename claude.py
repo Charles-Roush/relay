@@ -611,7 +611,7 @@ You are their coach responding to a direct message. Rules:
 - If they mention a PR, injury, or schedule change, note it in the profile or coach notes as appropriate.
 - Match their message's length and energy. Short question = short answer.
 - Pull from their data (HRV, splits, mileage, load trend) only when directly relevant.
-- STRICT limit: {max_sentences} sentences max. If their question is simple, use fewer.
+- STRICT limit: {max_sentences} sentences max. Most replies should be 3–5 sentences. If the question is simple, use fewer. Never write a list when a sentence will do.
 Tone: {tone}. Units: {units}.
 """
 
@@ -627,7 +627,7 @@ Tone: {tone}. Units: {units}.
         build_system_prompt(config),
         user_message,
         config,
-        max_tokens=600,
+        max_tokens=450,
         extra_messages=prefix_messages,
     )
 
@@ -693,7 +693,7 @@ Coach notes:
 Produce two parts using these exact XML tags:
 
 <athlete_summary>
-What the athlete reads — 6–10 sentences:
+What the athlete reads — 5–7 sentences max, no bullet points:
 - What went well: specific sessions, consistency, pacing execution, recovery wins. Use numbers.
 - What needs work: missed sessions, sleep/HRV red flags, intensity distribution problems, execution issues.
 - If any respiration/SpO2 flags appeared this week, call them out — may indicate illness or accumulated fatigue.
@@ -709,7 +709,7 @@ What the athlete reads — 6–10 sentences:
 
 <coaching_message>
 ### {week_label}
-Memory reflection — 3–5 sentences written for your future self, not the athlete:
+Memory reflection — 2–3 sentences written for your future self, not the athlete:
 Compress the week into durable patterns: how their body responded to load (cite actual HRV/sleep numbers),
 what's trending (fitness, recovery, form), Training Status trajectory, ACWR direction, notable weather conditions
 if they affected effort interpretation, and what to watch coming week.
@@ -720,4 +720,4 @@ This will be referenced in future daily updates — make it useful.
 Tone: {tone}. Units: {units}.
 """
 
-    return _call_claude("generate_weekly_reflection", build_system_prompt(config), user_prompt, config, max_tokens=1500)
+    return _call_claude("generate_weekly_reflection", build_system_prompt(config), user_prompt, config, max_tokens=900)

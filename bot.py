@@ -30,6 +30,41 @@ logging.basicConfig(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+TELEGRAM_MAX = 4096
+
+
+async def _send_long(bot_or_update, text: str, chat_id: str | None = None):
+    """
+    Send text respecting Telegram's 4096-char limit.
+    Splits on sentence boundaries where possible; falls back to hard split.
+    """
+    if len(text) <= TELEGRAM_MAX:
+        if chat_id:
+            await bot_or_update.send_message(chat_id=chat_id, text=text)
+        else:
+            await bot_or_update.message.reply_text(text)
+        return
+
+    chunks = []
+    remaining = text
+    while len(remaining) > TELEGRAM_MAX:
+        cut = remaining[:TELEGRAM_MAX].rfind('. ')
+        if cut < TELEGRAM_MAX // 2:
+            cut = remaining[:TELEGRAM_MAX].rfind('\n')
+        if cut < TELEGRAM_MAX // 2:
+            cut = TELEGRAM_MAX - 1
+        chunks.append(remaining[:cut + 1].strip())
+        remaining = remaining[cut + 1:].strip()
+    if remaining:
+        chunks.append(remaining)
+
+    for chunk in chunks:
+        if chat_id:
+            await bot_or_update.send_message(chat_id=chat_id, text=chunk)
+        else:
+            await bot_or_update.message.reply_text(chunk)
+
+
 # In-memory conversation history per chat
 _conversations: dict[str, list[dict]] = {}
 
@@ -154,7 +189,7 @@ async def run_daily_update():
         _conversations.clear()
 
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        await _send_long(bot, message, chat_id=TELEGRAM_CHAT_ID)
         logging.info("Daily update sent.")
 
     except Exception as e:
@@ -204,7 +239,7 @@ async def run_weekly_reflection():
 
         if athlete_summary:
             bot = Bot(token=TELEGRAM_BOT_TOKEN)
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=athlete_summary)
+            await _send_long(bot, athlete_summary, chat_id=TELEGRAM_CHAT_ID)
             logging.info("Weekly athlete summary sent to Telegram.")
 
     except Exception as e:
@@ -265,7 +300,7 @@ async def run_evening_checkin():
             _write_feedback(today, feedback_log)
 
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        await _send_long(bot, message, chat_id=TELEGRAM_CHAT_ID)
         logging.info("Evening check-in sent.")
 
     except Exception as e:
@@ -368,7 +403,7 @@ async def check_for_new_activity():
         message, _, _, _, _ = notes.parse_claude_response(response)
 
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        await _send_long(bot, message, chat_id=TELEGRAM_CHAT_ID)
 
         # Save state so we don't double-send
         _save_checkin_state({"last_seen_activity_id": str(activity_id)})
@@ -428,7 +463,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _add_to_history(chat_id, "user", user_message)
     _add_to_history(chat_id, "assistant", message)
 
-    await update.message.reply_text(message)
+    await _send_long(update, message)
 
 
 def _write_feedback(log_date: date, text: str):
@@ -527,7 +562,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, updated_notes, updated_profile, _, _feedback = notes.parse_claude_response(response)
     notes.apply_updates(updated_notes, updated_profile)
     _add_to_history(chat_id, "assistant", message)
-    await update.message.reply_text(message)
+    await _send_long(update, message)
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -558,7 +593,7 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send the athlete-facing summary; do NOT write to weekly_reflection.md (on-demand only)
     athlete_summary = notes.extract_tag(response, "athlete_summary")
     message = athlete_summary if athlete_summary else notes.parse_claude_response(response)[0]
-    await update.message.reply_text(message)
+    await _send_long(update, message)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):

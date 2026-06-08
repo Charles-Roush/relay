@@ -55,7 +55,7 @@ claude:
   evening_checkin:
     max_sentences: 6             # Hard cap on evening check-in length
   respond:
-    max_sentences: 8             # Cap for conversational replies
+    max_sentences: 6             # Cap for conversational replies
   daily_logs_days: 30            # Days of training history logs passed to Claude
   load_trend_days: 14            # Days used for easy/moderate/hard load trend analysis
   coach_notes:
