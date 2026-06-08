@@ -605,8 +605,13 @@ def main():
     scheduler.add_job(run_daily_update, "cron", hour=schedule_hour, minute=0)
     scheduler.add_job(run_weekly_reflection, "cron", day_of_week="sun", hour=weekly_reflection_hour, minute=0)
     scheduler.add_job(check_for_new_activity, "interval", hours=1)
-    scheduler.start()
-    logging.info(f"Scheduler started — daily update at {schedule_hour}:00 {tz_str}, weekly reflection Sundays at {weekly_reflection_hour}:00")
+    logging.info(f"Scheduler configured — daily update at {schedule_hour}:00 {tz_str}, weekly reflection Sundays at {weekly_reflection_hour}:00")
+
+    async def post_init(application):
+        scheduler.start()
+        logging.info("Scheduler started.")
+
+    app.post_init = post_init
 
     logging.info("Bot started, polling...")
     app.run_polling()

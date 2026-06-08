@@ -110,7 +110,7 @@ def write_notes(content: str):
         if line.strip() == "## Coach Notes":
             in_notes = True
             header_lines.append(line)
-        elif in_notes and line.strip():
+        elif in_notes:
             note_lines.append(line)
         elif not in_notes:
             header_lines.append(line)

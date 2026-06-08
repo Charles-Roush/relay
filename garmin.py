@@ -76,7 +76,6 @@ def fetch_garmin_data() -> dict:
     client = Garmin(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
     client.login()
     yesterday = today - timedelta(days=1)
-    start_date = today - timedelta(days=lookback_days)
 
     data = {}
 
