@@ -8,16 +8,27 @@ import re
 from datetime import date, timedelta
 from pathlib import Path
 
-LOGS_DIR = Path("logs")
+import yaml
+
 _METRICS_BLOCK = re.compile(r'## Metrics\n\n```.*?```\n\n', re.DOTALL)
 
 
+def _load_config() -> dict:
+    with open("config.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def _logs_dir() -> Path:
+    config = _load_config()
+    return Path(config.get("paths", {}).get("logs_dir", "logs"))
+
+
 def _log_path(d: date) -> Path:
-    return LOGS_DIR / f"{d.isoformat()}.md"
+    return _logs_dir() / f"{d.isoformat()}.md"
 
 
 def ensure_logs_dir():
-    LOGS_DIR.mkdir(exist_ok=True)
+    _logs_dir().mkdir(exist_ok=True)
 
 
 def write_daily_log(

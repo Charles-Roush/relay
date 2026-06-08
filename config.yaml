@@ -1,6 +1,14 @@
 schedule:
-  hour: 9           # Local hour to send daily update (24hr)
+  hour: 9                        # Local hour to send daily update (24hr)
+  weekly_reflection_hour: 20     # Hour on Sunday evening to generate weekly reflection
   timezone: "US/Eastern"
+
+paths:
+  logs_dir: "logs"
+  notes_file: "coach_notes.md"
+  plan_file: "training_plan.md"
+  profile_file: "athlete_profile.md"
+  weekly_reflection_file: "weekly_reflection.md"
 
 garmin:
   lookback_days: 10          # How many days of history to pull
@@ -17,7 +25,7 @@ claude:
   model: "claude-sonnet-4-6"
   max_tokens: 4000
   daily_update:
-    max_sentences: 10        # Max length of morning summary
+    max_sentences: 15        # Max length of morning summary
     tone: "direct"           # direct | encouraging | detailed
   coach_notes:
     max_lines: 20            # Max notes to keep at once
@@ -28,3 +36,7 @@ coaching:
   units: "imperial"          # imperial | metric
   focus: "Follow training"   # Informs Claude's recommendations — free text
   goal: "Late october 5k"    # Current goal — free text
+  post_workout_checkin: true # Proactively ask how a workout felt after detecting new activity
+
+history:
+  max_messages: 20           # Max conversation messages to retain per session (10 exchanges)

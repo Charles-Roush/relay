@@ -4,13 +4,7 @@ from pathlib import Path
 
 import yaml
 
-NOTES_FILE = Path("coach_notes.md")
-PLAN_FILE = Path("training_plan.md")
-PROFILE_FILE = Path("athlete_profile.md")
-
-NOTES_HEADER = "## Coach Notes\n\n"
-PLAN_HEADER = "## Training Plan\n\n"
-PROFILE_TEMPLATE = """\
+_PROFILE_TEMPLATE = """\
 ## Athlete Profile
 
 ### Personal Records
@@ -19,6 +13,9 @@ _No PRs logged yet._
 ### Injury History
 _No injuries logged._
 
+### Race History
+_No races logged yet._
+
 ### Training Observations
 _Claude will build observations here over time — pacing tendencies, recovery patterns, response to load, strengths and weaknesses._
 
@@ -26,43 +23,73 @@ _Claude will build observations here over time — pacing tendencies, recovery p
 _Updated by Claude as goals evolve._
 """
 
-_config: dict | None = None
+_WEEKLY_REFLECTION_HEADER = "## Weekly Reflections\n\n"
 
 
 def load_config() -> dict:
-    global _config
-    if _config is None:
-        with open("config.yaml") as f:
-            _config = yaml.safe_load(f)
-    return _config
+    with open("config.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def _paths(config: dict | None = None) -> dict:
+    if config is None:
+        config = load_config()
+    return config.get("paths", {})
+
+
+def _notes_file(config: dict | None = None) -> Path:
+    return Path(_paths(config).get("notes_file", "coach_notes.md"))
+
+
+def _plan_file(config: dict | None = None) -> Path:
+    return Path(_paths(config).get("plan_file", "training_plan.md"))
+
+
+def _profile_file(config: dict | None = None) -> Path:
+    return Path(_paths(config).get("profile_file", "athlete_profile.md"))
+
+
+def _weekly_reflection_file(config: dict | None = None) -> Path:
+    return Path(_paths(config).get("weekly_reflection_file", "weekly_reflection.md"))
 
 
 def read_notes() -> str:
-    if not NOTES_FILE.exists():
-        NOTES_FILE.write_text(NOTES_HEADER)
-    return NOTES_FILE.read_text()
+    f = _notes_file()
+    if not f.exists():
+        f.write_text("## Coach Notes\n\n")
+    return f.read_text()
 
 
 def read_plan() -> str:
-    if not PLAN_FILE.exists():
-        PLAN_FILE.write_text(PLAN_HEADER + "No training plan yet.\n")
-    return PLAN_FILE.read_text()
+    f = _plan_file()
+    if not f.exists():
+        f.write_text("## Training Plan\n\nNo training plan yet.\n")
+    return f.read_text()
 
 
 def read_profile() -> str:
-    if not PROFILE_FILE.exists():
-        PROFILE_FILE.write_text(PROFILE_TEMPLATE)
-    return PROFILE_FILE.read_text()
+    f = _profile_file()
+    if not f.exists():
+        f.write_text(_PROFILE_TEMPLATE)
+    return f.read_text()
+
+
+def read_weekly_reflection() -> str:
+    f = _weekly_reflection_file()
+    if not f.exists():
+        return ""
+    return f.read_text()
 
 
 def write_profile(content: str):
-    PROFILE_FILE.write_text(content if content.endswith("\n") else content + "\n")
+    f = _profile_file()
+    f.write_text(content if content.endswith("\n") else content + "\n")
 
 
 def append_to_profile(text: str):
     """Append a raw line to the profile (used for PR logging etc.)."""
     content = read_profile().rstrip()
-    PROFILE_FILE.write_text(content + "\n" + text + "\n")
+    _profile_file().write_text(content + "\n" + text + "\n")
 
 
 def write_notes(content: str):
@@ -106,7 +133,17 @@ def write_notes(content: str):
         filtered = filtered[-max_lines:]
 
     rebuilt = "## Coach Notes\n\n" + "\n".join(filtered) + "\n"
-    NOTES_FILE.write_text(rebuilt)
+    _notes_file().write_text(rebuilt)
+
+
+def write_weekly_reflection(content: str):
+    """Append a dated weekly reflection entry."""
+    f = _weekly_reflection_file()
+    existing = f.read_text() if f.exists() else _WEEKLY_REFLECTION_HEADER
+    # Ensure header exists
+    if not existing.startswith("## Weekly Reflections"):
+        existing = _WEEKLY_REFLECTION_HEADER + existing
+    f.write_text(existing.rstrip() + "\n\n" + content.strip() + "\n")
 
 
 def append_feedback_note(text: str):
@@ -122,7 +159,7 @@ def append_feedback_note(text: str):
 def parse_claude_response(response: str) -> tuple[str, str, str, str, str]:
     """
     Parse XML-tagged Claude response.
-    Returns (message, updated_notes, updated_profile, updated_plan).
+    Returns (message, updated_notes, updated_profile, updated_plan, feedback_log).
     Falls back gracefully if tags are missing.
     """
     msg_match = re.search(r'<coaching_message>(.*?)</coaching_message>', response, re.DOTALL)
@@ -146,3 +183,28 @@ def apply_updates(updated_notes: str, updated_profile: str):
     if updated_profile:
         write_profile(updated_profile)
     # updated_plan is intentionally never applied — training_plan.md is read-only
+
+
+def set_config_value(key_path: str, value) -> bool:
+    """
+    Update a config value by dot-notation key path and write back to config.yaml.
+    e.g. set_config_value("coaching.goal", "Sub-18 5K")
+    Returns True on success.
+    """
+    try:
+        with open("config.yaml") as f:
+            config = yaml.safe_load(f)
+
+        keys = key_path.split(".")
+        obj = config
+        for k in keys[:-1]:
+            if k not in obj:
+                return False
+            obj = obj[k]
+        obj[keys[-1]] = value
+
+        with open("config.yaml", "w") as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        return True
+    except Exception:
+        return False

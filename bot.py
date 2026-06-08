@@ -1,8 +1,10 @@
 """Unified bot — handles on-demand messages and scheduled daily updates via APScheduler."""
 
+import json
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,9 +27,33 @@ logging.basicConfig(
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# In-memory conversation history per chat (last 20 messages = 10 exchanges)
+# In-memory conversation history per chat
 _conversations: dict[str, list[dict]] = {}
-_MAX_HISTORY = 20
+
+# Track when the last daily update ran (for /ping)
+_last_daily_update: datetime | None = None
+
+# Path for post-workout check-in state (tracks last seen activity ID)
+_CHECKIN_STATE_FILE = Path("logs/checkin_state.json")
+
+
+def _load_checkin_state() -> dict:
+    if _CHECKIN_STATE_FILE.exists():
+        try:
+            return json.loads(_CHECKIN_STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {"last_seen_activity_id": None}
+
+
+def _save_checkin_state(state: dict):
+    _CHECKIN_STATE_FILE.parent.mkdir(exist_ok=True)
+    _CHECKIN_STATE_FILE.write_text(json.dumps(state))
+
+
+def _max_history() -> int:
+    config = notes.load_config()
+    return config.get("history", {}).get("max_messages", 20)
 
 
 def is_authorized(update: Update) -> bool:
@@ -42,12 +68,41 @@ def _add_to_history(chat_id: str, role: str, content: str):
     if chat_id not in _conversations:
         _conversations[chat_id] = []
     _conversations[chat_id].append({"role": role, "content": content})
-    if len(_conversations[chat_id]) > _MAX_HISTORY:
-        _conversations[chat_id] = _conversations[chat_id][-_MAX_HISTORY:]
+    max_h = _max_history()
+    if len(_conversations[chat_id]) > max_h:
+        _conversations[chat_id] = _conversations[chat_id][-max_h:]
+
+
+def _has_talked_today(chat_id: str) -> bool:
+    return bool(_conversations.get(chat_id))
+
+
+def startup_health_check() -> list[str]:
+    """
+    Validate that all required credentials and files are present.
+    Returns a list of error strings (empty = all good).
+    """
+    errors = []
+    if not TELEGRAM_BOT_TOKEN:
+        errors.append("TELEGRAM_BOT_TOKEN not set in .env")
+    if not TELEGRAM_CHAT_ID:
+        errors.append("TELEGRAM_CHAT_ID not set in .env")
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        errors.append("ANTHROPIC_API_KEY not set in .env")
+    if not os.getenv("GARMIN_EMAIL"):
+        errors.append("GARMIN_EMAIL not set in .env")
+    if not os.getenv("GARMIN_PASSWORD"):
+        errors.append("GARMIN_PASSWORD not set in .env")
+    if not Path("config.yaml").exists():
+        errors.append("config.yaml not found")
+    if not Path(notes.load_config().get("paths", {}).get("plan_file", "training_plan.md")).exists():
+        errors.append("training_plan.md not found — create it or the coach will have no plan to reference")
+    return errors
 
 
 async def run_daily_update():
     """Generate and send the daily coaching update. Fired by APScheduler."""
+    global _last_daily_update
     logging.info("Running daily update...")
     try:
         config = notes.load_config()
@@ -60,10 +115,20 @@ async def run_daily_update():
         training_plan = notes.read_plan()
         coach_notes = notes.read_notes()
         athlete_profile = notes.read_profile()
+        weekly_reflection = notes.read_weekly_reflection()
         recent_logs = daily_log.read_recent_logs(n_days=30)
 
+        # Check if user has already messaged today before the daily update fires
+        already_talked = _has_talked_today(TELEGRAM_CHAT_ID)
+
         response = claude.daily_update(
-            garmin_formatted, training_plan, coach_notes, athlete_profile, recent_logs
+            garmin_formatted,
+            training_plan,
+            coach_notes,
+            athlete_profile,
+            recent_logs=recent_logs,
+            weekly_reflection=weekly_reflection,
+            has_talked_today=already_talked,
         )
         message, updated_notes, updated_profile, _, _feedback = notes.parse_claude_response(response)
         notes.apply_updates(updated_notes, updated_profile)
@@ -73,6 +138,8 @@ async def run_daily_update():
             garmin_formatted=garmin_formatted,
             coaching_message=message,
         )
+
+        _last_daily_update = datetime.now(tz)
 
         # Fresh day — clear conversation history
         _conversations.clear()
@@ -88,6 +155,105 @@ async def run_daily_update():
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"Daily update failed: {e}")
         except Exception:
             pass
+
+
+async def run_weekly_reflection():
+    """Generate and save a weekly reflection. Fired Sunday evenings by APScheduler."""
+    logging.info("Running weekly reflection...")
+    try:
+        config = notes.load_config()
+        tz = ZoneInfo(config["schedule"]["timezone"])
+        now = datetime.now(tz)
+        # Label e.g. "Week of Jun 2–8, 2026"
+        week_start = now.date() - timedelta(days=6)
+        week_label = f"Week of {week_start.strftime('%b %-d')}–{now.strftime('%-d, %Y')}"
+
+        data = garmin.fetch_garmin_data()
+        garmin_formatted = garmin.format_garmin_data(data, units=config["coaching"]["units"])
+        recent_logs = daily_log.read_recent_logs(n_days=14)
+
+        response = claude.generate_weekly_reflection(
+            garmin_formatted=garmin_formatted,
+            training_plan=notes.read_plan(),
+            coach_notes=notes.read_notes(),
+            athlete_profile=notes.read_profile(),
+            recent_logs=recent_logs,
+            week_label=week_label,
+        )
+        reflection_text, _, _, _, _ = notes.parse_claude_response(response)
+        notes.write_weekly_reflection(reflection_text)
+        logging.info("Weekly reflection saved.")
+
+    except Exception as e:
+        logging.error(f"Weekly reflection failed: {e}", exc_info=True)
+
+
+async def check_for_new_activity():
+    """
+    Hourly job: check if a new workout appeared since the last check-in.
+    If so, and post_workout_checkin is enabled, send a short check-in message.
+    """
+    try:
+        config = notes.load_config()
+        if not config.get("coaching", {}).get("post_workout_checkin", False):
+            return
+
+        tz = ZoneInfo(config["schedule"]["timezone"])
+        now = datetime.now(tz)
+
+        # Fetch fresh data (invalidate cache so we see the newest workout)
+        garmin.invalidate_cache()
+        data = garmin.fetch_garmin_data()
+        latest = garmin.get_latest_activity(data)
+        if not latest:
+            return
+
+        activity_id = latest.get("activity_id")
+        activity_date = latest.get("date", "")
+        activity_time = latest.get("time", "")  # HH:MM
+
+        # Only trigger for activities that happened today
+        if activity_date != now.date().isoformat():
+            return
+
+        # Only trigger if the activity started within the last 3 hours
+        try:
+            act_hour, act_min = map(int, activity_time.split(":"))
+            act_dt = now.replace(hour=act_hour, minute=act_min, second=0, microsecond=0)
+            hours_ago = (now - act_dt).total_seconds() / 3600
+            if hours_ago > 3 or hours_ago < 0:
+                return
+        except Exception:
+            return
+
+        # Check if we've already sent a check-in for this activity
+        state = _load_checkin_state()
+        if str(activity_id) == str(state.get("last_seen_activity_id")):
+            return
+
+        # Build a brief activity summary for Claude
+        units = config["coaching"]["units"]
+        dist = latest.get("distance_meters")
+        dist_str = f"{dist / 1609.34:.1f} mi" if dist and units == "imperial" else (f"{dist / 1000:.1f} km" if dist else "unknown distance")
+        name = latest.get("name") or latest.get("type", "run")
+        activity_summary = f"{name}: {dist_str} at {activity_time}"
+
+        response = claude.post_workout_checkin(
+            activity_summary=activity_summary,
+            coach_notes=notes.read_notes(),
+            athlete_profile=notes.read_profile(),
+        )
+        message, _, _, _, _ = notes.parse_claude_response(response)
+
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+
+        # Save state so we don't double-send
+        _save_checkin_state({"last_seen_activity_id": str(activity_id)})
+        logging.info(f"Post-workout check-in sent for activity {activity_id}.")
+
+    except Exception as e:
+        logging.warning(f"Post-workout check-in failed: {e}")
 
 
 def _fetch_garmin(config: dict) -> str:
@@ -120,6 +286,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notes.read_profile(),
         history,
         garmin_formatted=garmin_formatted,
+        weekly_reflection=notes.read_weekly_reflection(),
     )
     message, updated_notes, updated_profile, _, feedback_log = notes.parse_claude_response(response)
     notes.apply_updates(updated_notes, updated_profile)
@@ -218,6 +385,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notes.read_profile(),
         history,
         garmin_formatted=garmin_formatted,
+        weekly_reflection=notes.read_weekly_reflection(),
     )
     message, updated_notes, updated_profile, _, _feedback = notes.parse_claude_response(response)
     notes.apply_updates(updated_notes, updated_profile)
@@ -245,6 +413,7 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         notes.read_profile(),
         [],
         garmin_formatted=garmin_formatted,
+        weekly_reflection=notes.read_weekly_reflection(),
     )
     message, updated_notes, updated_profile, _, _feedback = notes.parse_claude_response(response)
     notes.apply_updates(updated_notes, updated_profile)
@@ -269,6 +438,118 @@ async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Garmin cache cleared — next message will pull fresh data.")
 
 
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Health check — show uptime and last daily update time."""
+    if not is_authorized(update):
+        return
+    config = notes.load_config()
+    tz = ZoneInfo(config["schedule"]["timezone"])
+    now = datetime.now(tz)
+    if _last_daily_update:
+        delta = now - _last_daily_update
+        hours = int(delta.total_seconds() // 3600)
+        mins = int((delta.total_seconds() % 3600) // 60)
+        last_update_str = f"{_last_daily_update.strftime('%H:%M')} ({hours}h {mins}m ago)"
+    else:
+        last_update_str = "not yet (bot may have just restarted)"
+    await update.message.reply_text(
+        f"Bot is running.\n"
+        f"Current time: {now.strftime('%H:%M %Z')}\n"
+        f"Last daily update: {last_update_str}"
+    )
+
+
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Update a config value from Telegram.
+    Usage: /set <key> <value>
+
+    Supported keys:
+      tone        direct | encouraging | detailed
+      goal        <free text>
+      focus       <free text>
+      schedule    <hour 0-23>
+      checkin     true | false
+    """
+    if not is_authorized(update):
+        return
+
+    args = context.args if context.args else []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /set <key> <value>\n\n"
+            "Keys:\n"
+            "  tone       direct | encouraging | detailed\n"
+            "  goal       <your current goal, free text>\n"
+            "  focus      <training focus, free text>\n"
+            "  schedule   <hour 0-23 for daily update>\n"
+            "  checkin    true | false"
+        )
+        return
+
+    key = args[0].lower()
+    value_str = " ".join(args[1:])
+
+    key_map = {
+        "tone": ("claude.daily_update.tone", str),
+        "goal": ("coaching.goal", str),
+        "focus": ("coaching.focus", str),
+        "schedule": ("schedule.hour", int),
+        "checkin": ("coaching.post_workout_checkin", lambda v: v.lower() == "true"),
+    }
+
+    if key not in key_map:
+        await update.message.reply_text(
+            f"Unknown key '{key}'. Valid keys: {', '.join(key_map)}"
+        )
+        return
+
+    config_path, converter = key_map[key]
+    try:
+        value = converter(value_str)
+    except (ValueError, TypeError):
+        await update.message.reply_text(f"Invalid value '{value_str}' for key '{key}'.")
+        return
+
+    if key == "tone" and value not in ("direct", "encouraging", "detailed"):
+        await update.message.reply_text("Tone must be: direct, encouraging, or detailed.")
+        return
+
+    if key == "schedule":
+        if not (0 <= value <= 23):
+            await update.message.reply_text("Schedule hour must be 0–23.")
+            return
+
+    success = notes.set_config_value(config_path, value)
+    if success:
+        await update.message.reply_text(f"Updated: {key} = {value}")
+        if key == "schedule":
+            await update.message.reply_text(
+                "Note: schedule changes take effect after bot restart."
+            )
+    else:
+        await update.message.reply_text(f"Failed to update '{key}'. Check config.yaml.")
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current configurable settings."""
+    if not is_authorized(update):
+        return
+    config = notes.load_config()
+    c = config.get("coaching", {})
+    cl = config.get("claude", {}).get("daily_update", {})
+    s = config.get("schedule", {})
+    await update.message.reply_text(
+        f"Current settings:\n"
+        f"  goal:     {c.get('goal', '—')}\n"
+        f"  focus:    {c.get('focus', '—')}\n"
+        f"  tone:     {cl.get('tone', '—')}\n"
+        f"  schedule: {s.get('hour', '—')}:00 {s.get('timezone', '')}\n"
+        f"  checkin:  {c.get('post_workout_checkin', False)}\n\n"
+        f"Use /set <key> <value> to change."
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
@@ -281,7 +562,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today — today's plan + readiness check\n"
         "/week — summary of this week's training\n"
         "/status — view your current profile and coach notes\n"
+        "/settings — view current config settings\n"
+        "/set <key> <value> — update a setting\n"
         "/refresh — pull fresh Garmin data\n"
+        "/ping — check bot is alive\n"
         "/help — show this message\n\n"
         "Or just send any message to chat with your coach."
     )
@@ -291,6 +575,15 @@ def main():
     config = notes.load_config()
     tz_str = config["schedule"]["timezone"]
     schedule_hour = config["schedule"]["hour"]
+    weekly_reflection_hour = config["schedule"].get("weekly_reflection_hour", 20)
+
+    # Startup health check
+    errors = startup_health_check()
+    if errors:
+        for err in errors:
+            logging.warning(f"Health check: {err}")
+    else:
+        logging.info("Health check passed.")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -301,14 +594,19 @@ def main():
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = AsyncIOScheduler(timezone=tz_str)
     scheduler.add_job(run_daily_update, "cron", hour=schedule_hour, minute=0)
+    scheduler.add_job(run_weekly_reflection, "cron", day_of_week="sun", hour=weekly_reflection_hour, minute=0)
+    scheduler.add_job(check_for_new_activity, "interval", hours=1)
     scheduler.start()
-    logging.info(f"Scheduler started — daily update at {schedule_hour}:00 {tz_str}")
+    logging.info(f"Scheduler started — daily update at {schedule_hour}:00 {tz_str}, weekly reflection Sundays at {weekly_reflection_hour}:00")
 
     logging.info("Bot started, polling...")
     app.run_polling()

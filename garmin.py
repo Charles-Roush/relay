@@ -10,20 +10,19 @@ from garminconnect import Garmin
 
 load_dotenv(override=True)
 
-_CACHE_DIR = Path("logs")
-_config: dict | None = None
-
 
 def load_config() -> dict:
-    global _config
-    if _config is None:
-        with open("config.yaml") as f:
-            _config = yaml.safe_load(f)
-    return _config
+    with open("config.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def _cache_dir() -> Path:
+    config = load_config()
+    return Path(config.get("paths", {}).get("logs_dir", "logs"))
 
 
 def _cache_path(d: date) -> Path:
-    return _CACHE_DIR / f"garmin_cache_{d.isoformat()}.json"
+    return _cache_dir() / f"garmin_cache_{d.isoformat()}.json"
 
 
 def _load_cache(d: date) -> dict | None:
@@ -34,7 +33,7 @@ def _load_cache(d: date) -> dict | None:
 
 
 def _save_cache(d: date, data: dict):
-    _CACHE_DIR.mkdir(exist_ok=True)
+    _cache_dir().mkdir(exist_ok=True)
     _cache_path(d).write_text(json.dumps(data))
 
 
@@ -50,6 +49,14 @@ def invalidate_cache():
     path = _cache_path(today)
     if path.exists():
         path.unlink()
+
+
+def get_latest_activity(data: dict) -> dict | None:
+    """Return the most recent activity entry, or None."""
+    activities = data.get("activities")
+    if not isinstance(activities, list) or not activities:
+        return None
+    return activities[0]
 
 
 def fetch_garmin_data() -> dict:
@@ -235,6 +242,69 @@ def _hrv_trend_summary(hrv_values: list[dict]) -> str:
     )
 
 
+def _classify_activity_load(aerobic_te: float | None) -> str:
+    """Classify a run as easy/moderate/hard based on aerobic training effect."""
+    if aerobic_te is None:
+        return "unknown"
+    if aerobic_te < 2.0:
+        return "easy"
+    elif aerobic_te < 3.5:
+        return "moderate"
+    else:
+        return "hard"
+
+
+def _training_load_trend(activities: list[dict]) -> str:
+    """
+    Summarise the last 14 days of training load as easy/moderate/hard counts
+    and total distance. Gives Claude a quick picture of load distribution.
+    """
+    config = load_config()
+    tz_str = config["schedule"]["timezone"]
+    units = config["coaching"]["units"]
+    today = get_local_date(tz_str)
+    cutoff = today - timedelta(days=14)
+
+    easy = moderate = hard = unknown = 0
+    total_meters = 0.0
+
+    for a in activities:
+        try:
+            a_date = date.fromisoformat(a.get("date", ""))
+        except ValueError:
+            continue
+        if a_date < cutoff:
+            continue
+
+        dist = a.get("distance_meters") or 0
+        total_meters += dist
+
+        label = _classify_activity_load(a.get("aerobic_te"))
+        if label == "easy":
+            easy += 1
+        elif label == "moderate":
+            moderate += 1
+        elif label == "hard":
+            hard += 1
+        else:
+            unknown += 1
+
+    total_runs = easy + moderate + hard + unknown
+    if total_runs == 0:
+        return "No activity data for last 14 days."
+
+    if units == "imperial":
+        total_dist_str = f"{total_meters / 1609.34:.1f} mi"
+    else:
+        total_dist_str = f"{total_meters / 1000:.1f} km"
+
+    parts = [f"easy={easy}", f"moderate={moderate}", f"hard={hard}"]
+    if unknown:
+        parts.append(f"unclassified={unknown}")
+
+    return f"Last 14 days: {total_runs} runs, {total_dist_str} total | Load distribution (by aerobic TE): {', '.join(parts)}"
+
+
 def _pace_str(avg_speed_ms: float | None, units: str) -> str:
     """Convert avg speed (m/s) to pace string."""
     if not avg_speed_ms or avg_speed_ms <= 0:
@@ -297,8 +367,14 @@ def format_garmin_data(data: dict, units: str = "imperial") -> str:
             lines.append(f"Stress: avg={st.get('average', '?')} | max={st.get('max', '?')}")
 
     if "activities" in data and isinstance(data["activities"], list):
-        lines.append(f"\nRecent activities ({len(data['activities'])} shown):")
-        for a in data["activities"]:
+        activities = data["activities"]
+
+        # Training load trend block
+        load_trend = _training_load_trend(activities)
+        lines.append(f"\n{load_trend}")
+
+        lines.append(f"\nRecent activities ({len(activities)} shown):")
+        for a in activities:
             dist = a.get("distance_meters")
             if dist:
                 if units == "imperial":
@@ -318,7 +394,8 @@ def format_garmin_data(data: dict, units: str = "imperial") -> str:
             cadence_str = f"cadence={cadence:.0f}spm" if cadence else ""
             te = ""
             if a.get("aerobic_te") is not None:
-                te = f"aerobic TE={a['aerobic_te']:.1f}"
+                load_label = _classify_activity_load(a["aerobic_te"])
+                te = f"aerobic TE={a['aerobic_te']:.1f} ({load_label})"
             if a.get("anaerobic_te") is not None:
                 te += f" / anaerobic TE={a['anaerobic_te']:.1f}"
 
