@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Unified bot — handles on-demand messages and scheduled daily updates via APScheduler."""
 
 import json
@@ -118,7 +120,8 @@ async def run_daily_update():
         data = garmin.fetch_garmin_data()
         garmin_formatted = garmin.format_garmin_data(data, units=config["coaching"]["units"])
 
-        training_plan = notes.read_plan()
+        weekday = datetime.now(tz).strftime("%A")
+        plan_context = notes.parse_plan_context(notes.read_plan(), weekday)
         coach_notes = notes.read_notes()
         athlete_profile = notes.read_profile()
         weekly_reflection = notes.read_weekly_reflection()
@@ -129,7 +132,7 @@ async def run_daily_update():
 
         response = claude.daily_update(
             garmin_formatted,
-            training_plan,
+            plan_context,
             coach_notes,
             athlete_profile,
             recent_logs=recent_logs,
@@ -177,10 +180,12 @@ async def run_weekly_reflection():
         data = garmin.fetch_garmin_data()
         garmin_formatted = garmin.format_garmin_data(data, units=config["coaching"]["units"])
         recent_logs = daily_log.read_recent_logs(n_days=config["claude"].get("load_trend_days", 14))
+        weekday = datetime.now(tz).strftime("%A")
+        plan_context = notes.parse_plan_context(notes.read_plan(), weekday)
 
         response = claude.generate_weekly_reflection(
             garmin_formatted=garmin_formatted,
-            training_plan=notes.read_plan(),
+            plan_context=plan_context,
             coach_notes=notes.read_notes(),
             athlete_profile=notes.read_profile(),
             recent_logs=recent_logs,
@@ -241,10 +246,12 @@ async def run_evening_checkin():
                 morning_summary = analysis_match.group(1).strip()
 
         recent_logs = daily_log.read_recent_logs(n_days=config["claude"].get("daily_logs_days", 30))
+        weekday = datetime.now(tz).strftime("%A")
+        plan_context = notes.parse_plan_context(notes.read_plan(), weekday)
 
         response = claude.evening_checkin(
             garmin_formatted=garmin_formatted,
-            training_plan=notes.read_plan(),
+            plan_context=plan_context,
             coach_notes=notes.read_notes(),
             athlete_profile=notes.read_profile(),
             todays_feedback=todays_feedback,
@@ -255,7 +262,7 @@ async def run_evening_checkin():
         message, updated_notes, updated_profile, _, feedback_log = notes.parse_claude_response(response)
         notes.apply_updates(updated_notes, updated_profile)
         if feedback_log:
-            daily_log.append_feedback_to_log(today, feedback_log)
+            _write_feedback(today, feedback_log)
 
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
@@ -343,15 +350,18 @@ async def check_for_new_activity():
             f"started {activity_time}",
         ]))
 
-        garmin_formatted = garmin.format_garmin_data(data, units=units)
+        body_state = garmin.format_garmin_body_state(data, units=units)
         recent_logs = daily_log.read_recent_logs(n_days=config["claude"].get("daily_logs_days", 30))
+        tz = ZoneInfo(config["schedule"]["timezone"])
+        weekday = datetime.now(tz).strftime("%A")
+        plan_context = notes.parse_plan_context(notes.read_plan(), weekday)
 
         response = claude.post_workout_checkin(
             activity_summary=activity_summary,
             coach_notes=notes.read_notes(),
             athlete_profile=notes.read_profile(),
-            garmin_formatted=garmin_formatted,
-            training_plan=notes.read_plan(),
+            garmin_formatted=body_state,
+            plan_context=plan_context,
             recent_logs=recent_logs,
             weekly_reflection=notes.read_weekly_reflection(),
         )
@@ -368,14 +378,19 @@ async def check_for_new_activity():
         logging.warning(f"Post-workout check-in failed: {e}")
 
 
-def _fetch_garmin(config: dict) -> str:
-    """Fetch and format Garmin data, returning empty string on failure."""
+def _fetch_garmin(config: dict) -> tuple[str, str]:
+    """
+    Fetch and format Garmin data.
+    Returns (full_formatted, body_state_formatted).
+    Either string may be empty on failure.
+    """
     try:
         data = garmin.fetch_garmin_data()
-        return garmin.format_garmin_data(data, units=config["coaching"]["units"])
+        units = config["coaching"]["units"]
+        return garmin.format_garmin_data(data, units=units), garmin.format_garmin_body_state(data, units=units)
     except Exception as e:
         logging.warning(f"Garmin fetch failed: {e}")
-        return ""
+        return "", ""
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -389,12 +404,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Bust cache so any workout since the daily update is included
     garmin.invalidate_cache()
-    garmin_formatted = _fetch_garmin(config)
+    garmin_formatted, _ = _fetch_garmin(config)
     recent_logs = daily_log.read_recent_logs(n_days=config["claude"].get("daily_logs_days", 30))
+    tz = ZoneInfo(config["schedule"]["timezone"])
+    weekday = datetime.now(tz).strftime("%A")
+    plan_context = notes.parse_plan_context(notes.read_plan(), weekday)
 
     response = claude.respond_to_user(
         user_message,
-        notes.read_plan(),
+        plan_context,
         notes.read_notes(),
         notes.read_profile(),
         history,
@@ -405,7 +423,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, updated_notes, updated_profile, _, feedback_log = notes.parse_claude_response(response)
     notes.apply_updates(updated_notes, updated_profile)
     if feedback_log:
-        daily_log.append_feedback_to_log(date.today(), feedback_log)
+        _write_feedback(date.today(), feedback_log)
 
     _add_to_history(chat_id, "user", user_message)
     _add_to_history(chat_id, "assistant", message)
@@ -413,9 +431,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message)
 
 
+def _write_feedback(log_date: date, text: str):
+    """Write a feedback entry to both coach_notes and daily_log."""
+    notes.append_feedback_note(text)
+    daily_log.append_feedback_to_log(log_date, text)
+
+
 async def _log_feedback(update: Update, entry: str, reply: str):
-    notes.append_feedback_note(entry)
-    daily_log.append_feedback_to_log(date.today(), entry)
+    _write_feedback(date.today(), entry)
     await update.message.reply_text(reply)
 
 
@@ -487,14 +510,17 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config = notes.load_config()
 
     garmin.invalidate_cache()
-    garmin_formatted = _fetch_garmin(config)
+    _, body_state = _fetch_garmin(config)
     recent_logs = daily_log.read_recent_logs(n_days=config["claude"].get("daily_logs_days", 30))
+    tz = ZoneInfo(config["schedule"]["timezone"])
+    weekday = datetime.now(tz).strftime("%A")
+    plan_context = notes.parse_plan_context(notes.read_plan(), weekday)
 
     response = claude.today_readiness_check(
-        training_plan=notes.read_plan(),
+        plan_context=plan_context,
         coach_notes=notes.read_notes(),
         athlete_profile=notes.read_profile(),
-        garmin_formatted=garmin_formatted,
+        garmin_formatted=body_state,
         recent_logs=recent_logs,
         weekly_reflection=notes.read_weekly_reflection(),
     )
@@ -505,27 +531,33 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Summarize this week's training."""
+    """Summarize this week's training using the structured weekly reflection prompt."""
     if not is_authorized(update):
         return
-    recent = daily_log.read_recent_logs(n_days=7)
     config = notes.load_config()
-    garmin.invalidate_cache()
-    garmin_formatted = _fetch_garmin(config)
+    tz = ZoneInfo(config["schedule"]["timezone"])
+    now = datetime.now(tz)
+    week_start = now.date() - timedelta(days=6)
+    week_label = f"Week of {week_start.strftime('%b %-d')}–{now.strftime('%-d, %Y')}"
 
-    response = claude.respond_to_user(
-        "Give me a concise summary of this week's training. Cover: volume, quality of key sessions, "
-        "consistency, how recovery is trending, and one thing to watch heading into next week.",
-        notes.read_plan(),
-        notes.read_notes(),
-        notes.read_profile(),
-        [],
+    garmin.invalidate_cache()
+    garmin_formatted, _ = _fetch_garmin(config)
+    recent = daily_log.read_recent_logs(n_days=7)
+    weekday = now.strftime("%A")
+    plan_context = notes.parse_plan_context(notes.read_plan(), weekday)
+
+    response = claude.generate_weekly_reflection(
         garmin_formatted=garmin_formatted,
-        weekly_reflection=notes.read_weekly_reflection(),
+        plan_context=plan_context,
+        coach_notes=notes.read_notes(),
+        athlete_profile=notes.read_profile(),
         recent_logs=recent,
+        week_label=week_label,
+        weekly_reflection=notes.read_weekly_reflection(),
     )
-    message, updated_notes, updated_profile, _, _feedback = notes.parse_claude_response(response)
-    notes.apply_updates(updated_notes, updated_profile)
+    # Send the athlete-facing summary; do NOT write to weekly_reflection.md (on-demand only)
+    athlete_summary = notes.extract_tag(response, "athlete_summary")
+    message = athlete_summary if athlete_summary else notes.parse_claude_response(response)[0]
     await update.message.reply_text(message)
 
 
@@ -669,6 +701,90 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log a skipped session: /skip [reason]"""
+    if not is_authorized(update):
+        return
+    reason = " ".join(context.args).strip() if context.args else "no reason given"
+    entry = f"Skipped planned session — {reason}"
+    await _log_feedback(update, entry, f"Logged: {entry}")
+
+
+async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show a compact snapshot of current Garmin metrics."""
+    if not is_authorized(update):
+        return
+    config = notes.load_config()
+    try:
+        data = garmin.fetch_garmin_data()
+    except Exception as e:
+        await update.message.reply_text(f"Garmin fetch failed: {e}")
+        return
+
+    units = config["coaching"]["units"]
+    lines = ["Current metrics:"]
+
+    # HRV
+    hrv_list = data.get("hrv") or []
+    if hrv_list:
+        h = hrv_list[0]
+        lines.append(f"  HRV: {h.get('hrv')}ms ({h.get('status', '?')}) | weekly avg: {h.get('weekly_avg')}ms")
+
+    # RHR
+    rhr_list = data.get("resting_hr") or []
+    if rhr_list:
+        lines.append(f"  Resting HR: {rhr_list[0].get('rhr')} bpm")
+
+    # Body battery (today_summary is more accurate)
+    ts_sum = data.get("today_summary") or {}
+    bb_wake = ts_sum.get("body_battery_wake")
+    bb_now = ts_sum.get("body_battery_now")
+    bb_list = data.get("body_battery") or []
+    if bb_wake is not None or (bb_list and isinstance(bb_list[0], dict)):
+        wake = bb_wake or bb_list[0].get("start", "?")
+        now = bb_now or bb_list[0].get("end", "?")
+        lines.append(f"  Body Battery: wake={wake} | now={now}")
+
+    # Training Readiness
+    tr_list = data.get("training_readiness") or []
+    if tr_list:
+        t = tr_list[0]
+        lines.append(f"  Training Readiness: {t.get('score')} ({t.get('level', '?')})")
+
+    # VO2 max
+    if data.get("vo2max") is not None:
+        lines.append(f"  VO2 Max: {data['vo2max']:.1f}")
+
+    # Training load + ACWR
+    tl = data.get("training_load") or {}
+    if tl.get("acwr") is not None:
+        lines.append(f"  ACWR: {tl['acwr']:.2f} | acute={tl.get('acute', '?'):.0f} | chronic={tl.get('chronic', '?'):.0f}")
+
+    # Training status
+    ts = data.get("training_status") or {}
+    if ts.get("status"):
+        lines.append(f"  Training Status: {ts['status']}")
+
+    # LT HR
+    lt = data.get("lactate_threshold") or {}
+    if lt.get("hr"):
+        lines.append(f"  LT HR: {lt['hr']} bpm")
+
+    # Last 3 activities
+    acts = data.get("activities") or []
+    if acts:
+        lines.append("  Recent activities:")
+        for a in acts[:3]:
+            dist = a.get("distance_meters")
+            if dist:
+                dist_str = f"{dist/1609.34:.1f}mi" if units == "imperial" else f"{dist/1000:.1f}km"
+            else:
+                dist_str = "?"
+            lines.append(f"    {a.get('date')} {a.get('name', 'Run')} {dist_str} | HR={a.get('avg_hr','?')}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
@@ -677,7 +793,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/felt <rating or description> — log how a workout felt\n"
         "/rpe <1-10> [note] — log RPE\n"
         "/note <text> — quick note (injury, missed workout, etc.)\n"
+        "/skip [reason] — log a skipped planned session\n"
         "/pr <distance> <time> — log a personal record\n"
+        "/metrics — compact Garmin snapshot\n"
         "/today — today's plan + readiness check\n"
         "/week — summary of this week's training\n"
         "/status — view your current profile and coach notes\n"
@@ -718,7 +836,9 @@ def main():
     app.add_handler(CommandHandler("felt", cmd_felt))
     app.add_handler(CommandHandler("rpe", cmd_rpe))
     app.add_handler(CommandHandler("note", cmd_note))
+    app.add_handler(CommandHandler("skip", cmd_skip))
     app.add_handler(CommandHandler("pr", cmd_pr))
+    app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("status", cmd_status))

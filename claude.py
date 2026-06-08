@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 import os
 from datetime import datetime
@@ -153,6 +155,14 @@ You have a long-term coaching relationship with this athlete and a persistent me
 - Anchor tempo and threshold targets to LT pace when available. It's more precise than "comfortably hard."
 - When analyzing a run, compare average HR and peak lap HR to the LT HR. Running threshold intervals above LT HR is a form flag; running them well below means the athlete may be sandbagging.
 
+**Training plan philosophy:**
+- The training plan is a weekly guideline — a suggested volume and session mix for the week, not a strict day-by-day schedule. Days can shift based on readiness, weather, or life.
+- Coach to the week as a whole: the right sessions need to happen, but not necessarily on the exact prescribed day.
+- Use the plan as a reference for weekly volume and session mix. Coach based on what the data says, using the plan as context for what kind of week was intended.
+- Suggest an alternative week structure only when there is a strong and clear reason: ACWR above 1.4, Training Status "Overreaching", HRV declining for 3+ consecutive days, or the athlete is clearly undertrained and the plan is too conservative. Do this rarely.
+- When suggesting an alternative, keep it minimal: drop one run, swap a quality day for easy. Never rewrite the whole week.
+- Never rewrite or modify the training plan file.
+
 **Memory management — be selective:**
 - COACH NOTES: only flag things not already in the Garmin data or logs — injury hints, travel, context that won't be visible later. Most responses should not add notes.
 - ATHLETE PROFILE: permanent observations only — new PRs, confirmed injury patterns, long-term tendencies. Omit tag if nothing changed.
@@ -189,7 +199,7 @@ The training plan is READ-ONLY. Never include <updated_plan>."""
 
 def daily_update(
     garmin_formatted: str,
-    training_plan: str,
+    plan_context: dict,
     coach_notes: str,
     athlete_profile: str,
     recent_logs: str = "",
@@ -201,6 +211,7 @@ def daily_update(
     tz_str = config["schedule"]["timezone"]
     daily_logs_days = claude_cfg.get("daily_logs_days", 30)
     load_trend_days = claude_cfg.get("load_trend_days", 14)
+    lookback_days = config["garmin"].get("lookback_days", 10)
     tone = claude_cfg["daily_update"]["tone"]
     units = config["coaching"]["units"]
     goal = config["coaching"]["goal"]
@@ -228,8 +239,8 @@ def daily_update(
 {weekday}, {date_iso} at {time_str}
 Goal: {goal}
 
-Training plan (extract today's and tomorrow's sessions from this):
-{training_plan}
+This week's sessions (context — use as a volume and intensity reference, not a daily schedule):
+{plan_context["week_block"]}
 
 === RECOVERY — LAST NIGHT & CURRENT STATE ===
 {garmin_formatted}
@@ -253,7 +264,7 @@ Athlete profile:
 Write the morning coaching update. Structure your response as follows:
 
 1. RECOVERY & READINESS — synthesize all signals into one verdict:
-   - HRV: latest vs {load_trend_days}-day avg, direction, Garmin status
+   - HRV: latest vs {lookback_days}-day avg, direction, Garmin status
    - Sleep: last night deep + REM hours and score; multi-night trend
    - If respiration or SpO2 flags appear (⚠ markers in the data), name them explicitly — elevated
      respiration (>18 br/min) or low SpO2 (<95%) are early illness/overreaching signals and should
@@ -285,15 +296,18 @@ Write the morning coaching update. Structure your response as follows:
 
 4. LOAD BALANCE — assess the {load_trend_days}-day easy/moderate/hard distribution and activity pattern.
    The activity pattern (R = run, · = rest) shows the actual rhythm — flag if rest days are clustered
-   or if the athlete is running every day without recovery. Treat the training plan as a guideline;
-   use the pattern + load distribution to flag structural issues, not to grade strict adherence.
+   or if the athlete is running every day without recovery. The plan is a weekly volume/intensity guideline;
+   use the actual pattern + load data to flag structural issues, not to grade day-by-day adherence.
 
-5. TODAY'S RECOMMENDATION — specific and actionable. Default to the plan; override if signals warrant.
+5. TODAY'S RECOMMENDATION — specific and actionable.
+   Use the week's session menu as context. Recommend whatever makes the most sense for today given the data — which session from this week fits the athlete's current readiness. Most of the time this will match the plan's day order naturally; don't force it either way.
+   Only suggest restructuring the whole week if signals are strongly negative (ACWR >1.4, Overreaching status, 3+ days of declining HRV) or strongly positive (athlete significantly undertrained). Keep alternatives minimal — drop or swap one session.
    If prescribing threshold or tempo work, anchor to LT pace ({units}). Give HR ceiling relative to LT HR.
 
 6. TOMORROW PREVIEW — one sentence.
 
-Reference actual numbers. Be direct. Max ~{max_sentences} sentences total.
+Reference actual numbers. Be direct and specific — cite metrics, don't describe them.
+Keep each section to 1–3 sentences. Use short, declarative sentences over bullet lists.
 Tone: {tone}. Units: {units}.
 """
 
@@ -307,7 +321,7 @@ def post_workout_checkin(
     coach_notes: str,
     athlete_profile: str,
     garmin_formatted: str = "",
-    training_plan: str = "",
+    plan_context: dict | None = None,
     recent_logs: str = "",
     weekly_reflection: str = "",
 ) -> str:
@@ -325,9 +339,13 @@ def post_workout_checkin(
     date_iso, weekday, time_str = get_local_datetime(tz_str)
 
     body_state_block = garmin_formatted if garmin_formatted else "Not available."
-    plan_block = training_plan if training_plan else "Not available."
     logs_block = recent_logs if recent_logs and recent_logs != "No daily logs yet." else "None yet."
     reflection_block = weekly_reflection if weekly_reflection else "None yet."
+    pc = plan_context or {}
+    plan_block = (
+        f"This week's sessions (context):\n{pc['week_block']}"
+        if pc else "Not available."
+    )
 
     user_prompt = f"""\
 === DATE & CONTEXT ===
@@ -375,7 +393,7 @@ Tone: {tone}. Units: {units}.
 
 def evening_checkin(
     garmin_formatted: str,
-    training_plan: str,
+    plan_context: dict,
     coach_notes: str,
     athlete_profile: str,
     todays_feedback: str = "",
@@ -410,8 +428,8 @@ def evening_checkin(
 Goal: {goal}
 
 === TRAINING PLAN CONTEXT ===
-Training plan (extract today's planned session and tomorrow's session):
-{training_plan}
+This week's sessions (context — volume and intensity reference, not a day-by-day schedule):
+{plan_context["week_block"]}
 
 === TODAY'S GARMIN DATA (full) ===
 All recovery metrics (sleep, HRV, resting HR, body battery, stress, training readiness,
@@ -428,7 +446,7 @@ This morning's coaching read:
 {morning_block}
 
 === TRAINING CONTEXT ===
-Recent daily logs (last {load_trend_days} days):
+Recent daily logs (last 30 days):
 {logs_block}
 
 Last weekly reflection:
@@ -462,7 +480,7 @@ Max {max_sentences} sentences total. Tone: {tone}. Units: {units}.
 # ── On-Demand Readiness Flash Check (/today) ──────────────────────────────────
 
 def today_readiness_check(
-    training_plan: str,
+    plan_context: dict,
     coach_notes: str,
     athlete_profile: str,
     garmin_formatted: str = "",
@@ -491,8 +509,8 @@ def today_readiness_check(
 {time_str} on {weekday}, {date_iso}
 Goal: {goal}
 
-Today's scheduled session (extract from plan):
-{training_plan}
+This week's sessions (context):
+{plan_context["week_block"]}
 
 === CURRENT STATE ===
 {garmin_block}
@@ -535,7 +553,7 @@ Tone: {tone}. Units: {units}.
 
 def respond_to_user(
     user_message: str,
-    training_plan: str,
+    plan_context: dict,
     coach_notes: str,
     athlete_profile: str,
     conversation_history: list[dict] | None = None,
@@ -570,8 +588,8 @@ training status, recovery time, ACWR, load focus, lactate threshold):
 
 {load_trend_days}-day load trend, ACWR, and load focus distribution are in the Garmin data above.
 
-Training plan:
-{training_plan}
+This week's sessions (context):
+{plan_context["week_block"]}
 
 Recent daily logs + feedback:
 {logs_block}
@@ -618,7 +636,7 @@ Tone: {tone}. Units: {units}.
 
 def generate_weekly_reflection(
     garmin_formatted: str,
-    training_plan: str,
+    plan_context: dict,
     coach_notes: str,
     athlete_profile: str,
     recent_logs: str,
@@ -659,8 +677,8 @@ Logged RPE, feel, notes, and any PRs this week (from daily logs):
 {recent_logs}
 
 === CONTEXT ===
-Training plan (this week's prescribed sessions — treat as guideline):
-{training_plan}
+This week's prescribed sessions (treat as guideline):
+{plan_context["week_block"]}
 
 Prior weekly reflections (for pattern continuity):
 {prior_reflections}

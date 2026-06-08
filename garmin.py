@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 from datetime import date, datetime, timedelta
@@ -39,6 +41,64 @@ def _save_cache(d: date, data: dict):
     _cache_path(d).write_text(json.dumps(data))
 
 
+def _fitness_history_path(config: dict) -> Path:
+    return Path(config.get("paths", {}).get("fitness_history_file", "logs/fitness_history.json"))
+
+
+def _append_fitness_history(config: dict, today: date, data: dict) -> None:
+    """
+    Append today's key fitness metrics to a rolling history file.
+    Used to track VO2 max and training status trends over time.
+    Keeps one entry per date (upserts by date).
+    """
+    try:
+        path = _fitness_history_path(config)
+        path.parent.mkdir(exist_ok=True)
+        history: list[dict] = json.loads(path.read_text()) if path.exists() else []
+
+        # Build today's snapshot
+        vo2 = data.get("vo2max")
+        ts = data.get("training_status") or {}
+        hrv_list = data.get("hrv") or []
+        rhr_list = data.get("resting_hr") or []
+        today_str = today.isoformat()
+
+        tl = data.get("training_load") or {}
+        entry = {
+            "date": today_str,
+            "vo2max": float(vo2) if vo2 is not None else None,
+            "training_status": (data.get("training_status") or {}).get("status") if isinstance(data.get("training_status"), dict) else None,
+            "acwr": tl.get("acwr"),
+            "hrv": hrv_list[0].get("hrv") if hrv_list and isinstance(hrv_list[0], dict) else None,
+            "rhr": rhr_list[0].get("rhr") if rhr_list and isinstance(rhr_list[0], dict) else None,
+        }
+
+        # Upsert: replace existing entry for today if present
+        history = [h for h in history if h.get("date") != today_str]
+        history.append(entry)
+
+        # Keep last 180 days
+        history = sorted(history, key=lambda h: h["date"], reverse=True)[:180]
+        path.write_text(json.dumps(history, indent=2))
+    except Exception:
+        pass  # Never let history logging break a fetch
+
+
+def load_fitness_history(config: dict | None = None, days: int = 90) -> list[dict]:
+    """Load the rolling fitness history, newest first, limited to `days` entries."""
+    if config is None:
+        config = load_config()
+    path = _fitness_history_path(config)
+    if not path.exists():
+        return []
+    try:
+        history = json.loads(path.read_text())
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
+        return [h for h in history if h.get("date", "") >= cutoff]
+    except Exception:
+        return []
+
+
 def get_local_date(timezone_str: str) -> date:
     return datetime.now(ZoneInfo(timezone_str)).date()
 
@@ -61,6 +121,224 @@ def get_latest_activity(data: dict) -> dict | None:
     return activities[0]
 
 
+# ── Per-metric fetch helpers ────────────────────────────────────────────────────
+# Each helper takes (client, today, lookback_days) and returns the parsed list/dict.
+# Isolated try/except means one bad endpoint never kills other metrics.
+
+def _fetch_sleep(client, today: date, lookback_days: int) -> list[dict]:
+    result = []
+    for i in range(lookback_days):
+        d = (today - timedelta(days=i + 1)).isoformat()
+        try:
+            raw = client.get_sleep_data(d)
+            ds = raw.get("dailySleepDTO", {})
+            total_sec = ds.get("sleepTimeSeconds")
+            if not total_sec:
+                continue
+            result.append({
+                "date": d,
+                "total_seconds": total_sec,
+                "deep_seconds": ds.get("deepSleepSeconds"),
+                "rem_seconds": ds.get("remSleepSeconds"),
+                "light_seconds": ds.get("lightSleepSeconds"),
+                "awake_seconds": ds.get("awakeSleepSeconds"),
+                "score": ds.get("sleepScores", {}).get("overall", {}).get("value"),
+                "avg_respiration": ds.get("averageRespirationValue"),
+                "avg_spo2": ds.get("averageSpO2Value"),
+            })
+        except Exception:
+            pass
+    return result
+
+
+def _fetch_hrv(client, today: date, lookback_days: int) -> list[dict]:
+    result = []
+    for i in range(lookback_days):
+        d = (today - timedelta(days=i + 1)).isoformat()
+        try:
+            raw = client.get_hrv_data(d)
+            summary = raw.get("hrvSummary", {})
+            # Garmin returns lastNightAvg (overnight avg), not lastNight
+            val = summary.get("lastNightAvg") or summary.get("lastNight")
+            status = summary.get("status") or summary.get("hrvStatus")
+            weekly_avg = summary.get("weeklyAvg")
+            if val:
+                result.append({"date": d, "hrv": val, "status": status, "weekly_avg": weekly_avg})
+        except Exception:
+            pass
+    return result
+
+
+def _fetch_rhr(client, today: date, lookback_days: int) -> list[dict]:
+    result = []
+    for i in range(lookback_days):
+        d = (today - timedelta(days=i)).isoformat()
+        try:
+            raw = client.get_rhr_day(d)
+            val = None
+            if isinstance(raw, dict):
+                # Format: {"allMetrics": {"metricsMap": {"WELLNESS_RESTING_HEART_RATE": [{"value": X}]}}}
+                metrics_map = raw.get("allMetrics", {}).get("metricsMap", {})
+                rhr_entries = metrics_map.get("WELLNESS_RESTING_HEART_RATE", [])
+                if rhr_entries:
+                    val = rhr_entries[0].get("value")
+                if val is None:
+                    val = (raw.get("value") or {}).get("value") or raw.get("restingHeartRate")
+            elif isinstance(raw, list) and raw:
+                val = raw[0].get("value") or raw[0].get("restingHeartRate")
+            if val:
+                result.append({"date": d, "rhr": int(val)})
+        except Exception:
+            pass
+    return result
+
+
+def _fetch_body_battery(client, today: date, lookback_days: int) -> list[dict]:
+    result = []
+    for i in range(lookback_days):
+        d = (today - timedelta(days=i)).isoformat()
+        try:
+            raw = client.get_body_battery(d)
+            if not raw or not isinstance(raw, list):
+                continue
+            entry = raw[0] if isinstance(raw[0], dict) else None
+            if entry:
+                # Format: [{"date": ..., "bodyBatteryValuesArray": [[ts_ms, val], ...]}]
+                values = entry.get("bodyBatteryValuesArray", [])
+                if values:
+                    start_val = values[0][1] if values[0] else None
+                    end_val = values[-1][1] if values[-1] else None
+                else:
+                    start_val = entry.get("charged")
+                    end_val = None
+            else:
+                # Older format: list of [ts_ms, val] pairs
+                start_val = raw[0][1] if isinstance(raw[0], (list, tuple)) else None
+                end_val = raw[-1][1] if isinstance(raw[-1], (list, tuple)) else None
+            if start_val is not None:
+                result.append({"date": d, "start": start_val, "end": end_val})
+        except Exception:
+            pass
+    return result
+
+
+def _fetch_stress(client, today: date, lookback_days: int) -> list[dict]:
+    result = []
+    for i in range(lookback_days):
+        d = (today - timedelta(days=i)).isoformat()
+        try:
+            raw = client.get_stress_data(d)
+            if not isinstance(raw, dict):
+                continue
+            # Garmin returns avgStressLevel (not overallStressLevel)
+            avg = raw.get("avgStressLevel") or raw.get("overallStressLevel")
+            max_s = raw.get("maxStressLevel")
+            if avg is not None and avg >= 0:
+                result.append({"date": d, "average": avg, "max": max_s})
+        except Exception:
+            pass
+    return result
+
+
+def _fetch_training_readiness(client, today: date, lookback_days: int) -> list[dict]:
+    result = []
+    for i in range(lookback_days):
+        d = (today - timedelta(days=i)).isoformat()
+        try:
+            raw = client.get_training_readiness(d)
+            items = raw if isinstance(raw, list) else [raw]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                score = item.get("score") or item.get("trainingReadinessScore")
+                level = item.get("level") or item.get("trainingReadinessLevel")
+                feedback = item.get("feedback") or item.get("feedbackLongPhrase")
+                if score is not None:
+                    result.append({"date": d, "score": score, "level": level, "feedback": feedback})
+                    break
+        except Exception:
+            pass
+    return result
+
+
+def _fetch_steps(client, today: date, lookback_days: int) -> list[dict]:
+    result = []
+    for i in range(lookback_days):
+        d = (today - timedelta(days=i)).isoformat()
+        try:
+            raw = client.get_steps_data(d)
+            total = sum(s.get("steps", 0) for s in raw) if isinstance(raw, list) else 0
+            result.append({"date": d, "steps": total})
+        except Exception:
+            pass
+    return result
+
+
+_TRAINING_STATUS_CODES = {
+    0: "Unknown", 1: "No Status", 2: "Overreaching", 3: "Maintaining",
+    4: "Productive", 5: "Recovering", 6: "Peaking", 7: "Detraining",
+}
+
+
+def _fetch_training_and_vo2(client, today: date) -> dict:
+    """
+    Fetch training status, load, ACWR, load focus, and VO2 max from a single
+    get_training_status() call. Returns a dict with keys:
+    vo2max, training_status, training_load.
+    """
+    out: dict = {"vo2max": None, "training_status": None, "training_load": None}
+    try:
+        raw = client.get_training_status(today.isoformat())
+        if not isinstance(raw, dict):
+            return out
+
+        # ── VO2 max ──
+        generic = (raw.get("mostRecentVO2Max") or {}).get("generic") or {}
+        vo2 = generic.get("vo2MaxPreciseValue") or generic.get("vo2MaxValue")
+        out["vo2max"] = float(vo2) if vo2 is not None else None
+
+        # ── Training Status + ACWR + load ──
+        status_map = ((raw.get("mostRecentTrainingStatus") or {})
+                      .get("latestTrainingStatusData") or {})
+        device_entry = None
+        for entry in status_map.values():
+            if isinstance(entry, dict) and entry.get("trainingStatus") is not None:
+                device_entry = entry
+                break
+
+        if device_entry:
+            code = device_entry.get("trainingStatus")
+            status_str = _TRAINING_STATUS_CODES.get(code, f"code={code}") if code is not None else None
+            out["training_status"] = {"status": status_str, "recovery_hours": None}
+
+            # ACWR + load: nested inside device_entry.acuteTrainingLoadDTO
+            atl_dto = device_entry.get("acuteTrainingLoadDTO") or {}
+            acwr = atl_dto.get("dailyAcuteChronicWorkloadRatio")
+            acute = atl_dto.get("dailyTrainingLoadAcute")
+            chronic = atl_dto.get("dailyTrainingLoadChronic")
+            if acwr is not None:
+                out["training_load"] = {
+                    "acute": round(acute, 1) if acute is not None else None,
+                    "chronic": round(chronic, 1) if chronic is not None else None,
+                    "acwr": round(acwr, 2),
+                }
+
+        # ── Load focus ──
+        lb_map = ((raw.get("mostRecentTrainingLoadBalance") or {})
+                  .get("metricsTrainingLoadBalanceDTOMap") or {})
+        lf_entry = next(iter(lb_map.values()), None) if lb_map else None
+        if lf_entry and out["training_status"] is not None:
+            out["training_status"]["load_focus"] = {
+                "aerobicLow": lf_entry.get("monthlyLoadAerobicLow"),
+                "aerobicHigh": lf_entry.get("monthlyLoadAerobicHigh"),
+                "anaerobic": lf_entry.get("monthlyLoadAnaerobic"),
+                "feedback": lf_entry.get("trainingBalanceFeedbackPhrase"),
+            }
+    except Exception:
+        pass
+    return out
+
+
 def fetch_garmin_data() -> dict:
     config = load_config()
     tz_str = config["schedule"]["timezone"]
@@ -76,262 +354,94 @@ def fetch_garmin_data() -> dict:
     # Fetch 2x lookback to ensure full coverage even with multiple activities per day
     activities_fetch_count = lookback_days * 2
 
+    # Retry login up to 2 times on transient failures
     client = Garmin(os.getenv("GARMIN_EMAIL"), os.getenv("GARMIN_PASSWORD"))
-    client.login()
+    last_exc = None
+    for attempt in range(3):
+        try:
+            client.login()
+            break
+        except Exception as e:
+            last_exc = e
+            import time; time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError(f"Garmin login failed after 3 attempts: {last_exc}")
 
     data = {}
 
     if metrics.get("sleep"):
         try:
-            sleep_history = []
-            for i in range(lookback_days):
-                d = (today - timedelta(days=i + 1)).isoformat()
-                try:
-                    raw = client.get_sleep_data(d)
-                    ds = raw.get("dailySleepDTO", {})
-                    total_sec = ds.get("sleepTimeSeconds")
-                    if not total_sec:
-                        continue
-                    sleep_history.append({
-                        "date": d,
-                        "total_seconds": total_sec,
-                        "deep_seconds": ds.get("deepSleepSeconds"),
-                        "rem_seconds": ds.get("remSleepSeconds"),
-                        "light_seconds": ds.get("lightSleepSeconds"),
-                        "awake_seconds": ds.get("awakeSleepSeconds"),
-                        "score": ds.get("sleepScores", {}).get("overall", {}).get("value"),
-                        "avg_respiration": ds.get("averageRespirationValue"),
-                        "avg_spo2": ds.get("averageSpO2Value"),
-                    })
-                except Exception:
-                    pass
-            data["sleep"] = sleep_history
+            data["sleep"] = _fetch_sleep(client, today, lookback_days)
         except Exception as e:
             data["sleep"] = {"error": str(e)}
 
     if metrics.get("hrv"):
         try:
-            hrv_values = []
-            for i in range(lookback_days):
-                d = (today - timedelta(days=i + 1)).isoformat()
-                try:
-                    raw = client.get_hrv_data(d)
-                    summary = raw.get("hrvSummary", {})
-                    val = summary.get("lastNight")
-                    status = summary.get("hrvStatus")
-                    weekly_avg = summary.get("weeklyAvg")
-                    if val:
-                        hrv_values.append({
-                            "date": d,
-                            "hrv": val,
-                            "status": status,
-                            "weekly_avg": weekly_avg,
-                        })
-                except Exception:
-                    pass
-            data["hrv"] = hrv_values
+            data["hrv"] = _fetch_hrv(client, today, lookback_days)
         except Exception as e:
             data["hrv"] = {"error": str(e)}
 
     if metrics.get("resting_hr"):
         try:
-            rhr_history = []
-            for i in range(lookback_days):
-                d = (today - timedelta(days=i)).isoformat()
-                try:
-                    raw = client.get_rhr_day(d)
-                    # garminconnect returns {"value": {"calendarDate": ..., "value": X}} or list
-                    val = None
-                    if isinstance(raw, dict):
-                        val = (raw.get("value") or {}).get("value") or raw.get("restingHeartRate")
-                    elif isinstance(raw, list) and raw:
-                        val = raw[0].get("value") or raw[0].get("restingHeartRate")
-                    if val:
-                        rhr_history.append({"date": d, "rhr": val})
-                except Exception:
-                    pass
-            data["resting_hr"] = rhr_history
+            data["resting_hr"] = _fetch_rhr(client, today, lookback_days)
         except Exception as e:
             data["resting_hr"] = {"error": str(e)}
 
     if metrics.get("body_battery"):
         try:
-            bb_history = []
-            for i in range(lookback_days):
-                d = (today - timedelta(days=i)).isoformat()
-                try:
-                    raw = client.get_body_battery(d)
-                    if raw and isinstance(raw, list):
-                        start_val = raw[0][1]
-                        end_val = raw[-1][1]
-                        if start_val is not None:
-                            bb_history.append({"date": d, "start": start_val, "end": end_val})
-                except Exception:
-                    pass
-            data["body_battery"] = bb_history
+            data["body_battery"] = _fetch_body_battery(client, today, lookback_days)
         except Exception as e:
             data["body_battery"] = {"error": str(e)}
 
     if metrics.get("steps"):
         try:
-            steps_history = []
-            for i in range(lookback_days):
-                d = (today - timedelta(days=i)).isoformat()
-                try:
-                    raw = client.get_steps_data(d)
-                    total = sum(s.get("steps", 0) for s in raw) if isinstance(raw, list) else 0
-                    steps_history.append({"date": d, "steps": total})
-                except Exception:
-                    pass
-            data["steps"] = steps_history
+            data["steps"] = _fetch_steps(client, today, lookback_days)
         except Exception as e:
             data["steps"] = {"error": str(e)}
 
     if metrics.get("stress"):
         try:
-            stress_history = []
-            for i in range(lookback_days):
-                d = (today - timedelta(days=i)).isoformat()
-                try:
-                    raw = client.get_stress_data(d)
-                    avg = raw.get("overallStressLevel") if isinstance(raw, dict) else None
-                    max_s = raw.get("maxStressLevel") if isinstance(raw, dict) else None
-                    rest_stress = raw.get("restStressPercentage") if isinstance(raw, dict) else None
-                    if avg is not None and avg >= 0:
-                        stress_history.append({
-                            "date": d,
-                            "average": avg,
-                            "max": max_s,
-                            "rest_pct": rest_stress,
-                        })
-                except Exception:
-                    pass
-            data["stress"] = stress_history
+            data["stress"] = _fetch_stress(client, today, lookback_days)
         except Exception as e:
             data["stress"] = {"error": str(e)}
 
     if metrics.get("training_readiness"):
         try:
-            tr_history = []
-            for i in range(lookback_days):
-                d = (today - timedelta(days=i)).isoformat()
-                try:
-                    raw = client.get_training_readiness(d)
-                    items = raw if isinstance(raw, list) else [raw]
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        score = item.get("score") or item.get("trainingReadinessScore")
-                        level = item.get("level") or item.get("trainingReadinessLevel")
-                        feedback = item.get("feedback") or item.get("feedbackLongPhrase")
-                        if score is not None:
-                            tr_history.append({"date": d, "score": score, "level": level, "feedback": feedback})
-                            break
-                except Exception:
-                    pass
-            data["training_readiness"] = tr_history
+            data["training_readiness"] = _fetch_training_readiness(client, today, lookback_days)
         except Exception as e:
             data["training_readiness"] = {"error": str(e)}
 
-    if metrics.get("vo2max"):
-        try:
-            raw = client.get_max_metrics(today.isoformat())
-            vo2 = None
-            if isinstance(raw, list) and raw:
-                item = raw[0]
-                generic = item.get("generic") or {}
-                vo2 = generic.get("vo2MaxPreciseValue") or generic.get("vo2MaxValue") or item.get("vo2MaxValue")
-            elif isinstance(raw, dict):
-                generic = raw.get("generic") or {}
-                vo2 = generic.get("vo2MaxPreciseValue") or generic.get("vo2MaxValue") or raw.get("vo2MaxValue")
-            data["vo2max"] = vo2
-        except Exception:
-            data["vo2max"] = None
+    # Training status, load, ACWR, VO2 max all from a single get_training_status() call
+    if metrics.get("training_status") or metrics.get("training_load") or metrics.get("vo2max"):
+        result = _fetch_training_and_vo2(client, today)
+        data["vo2max"] = result["vo2max"]
+        data["training_status"] = result["training_status"]
+        data["training_load"] = result["training_load"]
 
-    if metrics.get("lactate_threshold"):
-        try:
-            raw = client.get_lactate_threshold()
-            # API returns {"statisticsStartDate": ..., "lactateThresholdHeartRateUsed": bool,
-            #              "heartRateThreshold": X, "ltPaceSecondsPerMeter": X, ...}
-            items = raw if isinstance(raw, list) else [raw]
-            lt = None
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                hr = item.get("heartRateThreshold") or item.get("lactateThresholdHeartRate")
-                pace_spm = item.get("ltPaceSecondsPerMeter")  # seconds per meter
-                if hr or pace_spm:
-                    lt = {"hr": hr, "pace_spm": pace_spm}
-                    break
-            data["lactate_threshold"] = lt
-        except Exception:
-            data["lactate_threshold"] = None
+    # LT HR is not exposed by garminconnect on this device — read from config if manually set.
+    lt_hr = g_cfg.get("lactate_threshold_hr")
+    data["lactate_threshold"] = {"hr": int(lt_hr)} if lt_hr else None
 
-    if metrics.get("training_status"):
-        # training_status covers: Training Status label, Recovery Time, Load Focus
-        try:
-            raw = client.get_training_status(today.isoformat())
-            items = raw if isinstance(raw, list) else [raw]
-            ts = None
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                # Training Status
-                status = (
-                    item.get("trainingStatus")
-                    or item.get("trainingStatusLoad", {}).get("trainingStatus")
-                )
-                # Recovery Time (hours until recovered)
-                recovery_hrs = (
-                    item.get("recoveryTime")
-                    or item.get("mostRecentRecoveryTime")
-                )
-                # Load Focus — balance across base/tempo/threshold/anaerobic buckets
-                load_focus = item.get("trainingLoadBalance") or item.get("loadFocusBalance")
-                if status or recovery_hrs is not None:
-                    ts = {
-                        "status": status,
-                        "recovery_hours": recovery_hrs,
-                        "load_focus": load_focus,
-                    }
-                    break
-            data["training_status"] = ts
-        except Exception:
-            data["training_status"] = None
-
-    if metrics.get("training_load"):
-        # Acute load, chronic load, and ACWR (acute:chronic workload ratio)
-        try:
-            raw = client.get_training_load(today.isoformat())
-            items = raw if isinstance(raw, list) else [raw]
-            tl = None
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                acute = (
-                    item.get("acuteLoad")
-                    or item.get("shortTermLoadValue")
-                    or item.get("sevenDayLoad")
-                )
-                chronic = (
-                    item.get("chronicLoad")
-                    or item.get("longTermLoadValue")
-                    or item.get("twentyEightDayLoad")
-                )
-                # ACWR may come directly or we compute it
-                acwr = item.get("acuteChronicWorkloadRatio")
-                if acwr is None and acute and chronic and chronic > 0:
-                    acwr = round(acute / chronic, 2)
-                if acute is not None or chronic is not None:
-                    tl = {
-                        "acute": acute,
-                        "chronic": chronic,
-                        "acwr": acwr,
-                    }
-                    break
-            data["training_load"] = tl
-        except Exception:
-            data["training_load"] = None
+    # get_user_summary: enriches body battery and respiration with today's precise values
+    try:
+        summary = client.get_user_summary(today.isoformat())
+        if isinstance(summary, dict):
+            data["today_summary"] = {
+                "body_battery_wake": summary.get("bodyBatteryAtWakeTime"),
+                "body_battery_high": summary.get("bodyBatteryHighestValue"),
+                "body_battery_low": summary.get("bodyBatteryLowestValue"),
+                "body_battery_now": summary.get("bodyBatteryMostRecentValue"),
+                "avg_waking_respiration": summary.get("avgWakingRespirationValue"),
+                "avg_spo2": summary.get("averageSpo2"),
+                "lowest_spo2": summary.get("lowestSpo2"),
+                "resting_hr": summary.get("restingHeartRate"),
+                "avg_stress": summary.get("averageStressLevel"),
+                "steps": summary.get("totalSteps"),
+            }
+        else:
+            data["today_summary"] = None
+    except Exception:
+        data["today_summary"] = None
 
     if metrics.get("activities"):
         try:
@@ -441,6 +551,7 @@ def fetch_garmin_data() -> dict:
             data["activities"] = {"error": str(e)}
 
     _save_cache(today, data)
+    _append_fitness_history(config, today, data)
     return data
 
 
@@ -687,6 +798,23 @@ def format_garmin_data(data: dict, units: str = "imperial") -> str:
                     f"deep={deep}h | REM={rem}h | light={light}h | awake={awake}h{extra_str}"
                 )
 
+    # ── Today's waking vitals (from get_user_summary — more accurate than nightly averages) ──
+    ts = data.get("today_summary") or {}
+    waking_resp = ts.get("avg_waking_respiration")
+    avg_spo2 = ts.get("avg_spo2")
+    low_spo2 = ts.get("lowest_spo2")
+    if waking_resp is not None or avg_spo2 is not None:
+        vitals_parts = []
+        if waking_resp is not None:
+            flag = " ⚠" if waking_resp > 18 else ""
+            vitals_parts.append(f"waking resp={waking_resp:.1f} br/min{flag}")
+        if avg_spo2 is not None:
+            flag = " ⚠" if avg_spo2 < 95 else ""
+            vitals_parts.append(f"avg SpO2={avg_spo2:.1f}%{flag}")
+        if low_spo2 is not None and low_spo2 < 94:
+            vitals_parts.append(f"low SpO2={low_spo2:.1f}% ⚠")
+        lines.append(f"Today's waking vitals: {' | '.join(vitals_parts)}")
+
     # ── HRV ──
     if "hrv" in data and isinstance(data["hrv"], list) and data["hrv"]:
         lines.append(f"HRV: {_hrv_trend_summary(data['hrv'])}")
@@ -713,9 +841,14 @@ def format_garmin_data(data: dict, units: str = "imperial") -> str:
     if "body_battery" in data and isinstance(data["body_battery"], list) and data["body_battery"]:
         bb_list = data["body_battery"]
         today_bb = bb_list[0]
-        lines.append(
-            f"Body Battery (today): started={today_bb.get('start', '?')} | current={today_bb.get('end', '?')}"
-        )
+        ts = data.get("today_summary") or {}
+        wake_val = ts.get("body_battery_wake") or today_bb.get("start", "?")
+        now_val = ts.get("body_battery_now") or today_bb.get("end", "?")
+        high_val = ts.get("body_battery_high")
+        bb_line = f"Body Battery (today): wake={wake_val} | current={now_val}"
+        if high_val is not None:
+            bb_line += f" | daily_high={high_val}"
+        lines.append(bb_line)
         trend_str = _body_battery_trend(bb_list)
         if trend_str:
             lines.append(trend_str)
@@ -723,7 +856,7 @@ def format_garmin_data(data: dict, units: str = "imperial") -> str:
             history = ", ".join(
                 f"{b['date']}: {b.get('start', '?')}→{b.get('end', '?')}" for b in bb_list[1:]
             )
-            lines.append(f"  Prior days (start→end): {history}")
+            lines.append(f"  Prior days (wake→end): {history}")
 
     # ── Stress ──
     if "stress" in data and isinstance(data["stress"], list) and data["stress"]:
@@ -753,9 +886,22 @@ def format_garmin_data(data: dict, units: str = "imperial") -> str:
             history = ", ".join(f"{t['date']}: {t['score']}" for t in tr_list[1:])
             lines.append(f"  Prior readiness scores: {history}")
 
-    # ── VO2 Max ──
+    # ── VO2 Max + trend ──
     if data.get("vo2max") is not None:
-        lines.append(f"VO2 Max estimate: {data['vo2max']:.1f} ml/kg/min")
+        vo2_line = f"VO2 Max estimate: {data['vo2max']:.1f} ml/kg/min"
+        # Append trend from fitness history (show last 4 distinct values)
+        try:
+            fh = load_fitness_history(config, days=90)
+            vo2_vals = [(h["date"], h["vo2max"]) for h in fh if h.get("vo2max") is not None]
+            if len(vo2_vals) >= 2:
+                oldest, newest = vo2_vals[-1][1], vo2_vals[0][1]
+                delta = newest - oldest
+                direction = "↑" if delta > 0.5 else ("↓" if delta < -0.5 else "→")
+                trend_str = " | ".join(f"{v:.1f}" for _, v in reversed(vo2_vals[:4]))
+                vo2_line += f" | 90-day trend {direction}: {trend_str}"
+        except Exception:
+            pass
+        lines.append(vo2_line)
 
     # ── Lactate Threshold ──
     lt = data.get("lactate_threshold")
@@ -779,15 +925,34 @@ def format_garmin_data(data: dict, units: str = "imperial") -> str:
             ts_parts.append(f"recovery time={rh}h")
         if ts_parts:
             lines.append(f"Training Status: {' | '.join(ts_parts)}")
+        # Training status trend from fitness history
+        try:
+            fh = load_fitness_history(config, days=60)
+            status_vals = [(h["date"], h["training_status"]) for h in fh if h.get("training_status")]
+            if len(status_vals) >= 2:
+                recent = status_vals[:6]
+                trend_str = " → ".join(f"{v}" for _, v in reversed(recent))
+                lines.append(f"  Training Status trend (60d): {trend_str}")
+        except Exception:
+            pass
         lf = ts.get("load_focus")
         if lf and isinstance(lf, dict):
             lf_parts = []
-            for bucket in ("base", "tempo", "threshold", "anaerobic", "highAerobic", "lowAerobic"):
-                v = lf.get(bucket)
+            # Field names from actual API response
+            field_labels = [
+                ("aerobicLow", "aerobic base"),
+                ("aerobicHigh", "aerobic high"),
+                ("anaerobic", "anaerobic"),
+            ]
+            for key, label in field_labels:
+                v = lf.get(key)
                 if v is not None:
-                    lf_parts.append(f"{bucket}={v:.0f}%")
+                    lf_parts.append(f"{label}={v:.0f}")
+            feedback = lf.get("feedback")
+            if feedback:
+                lf_parts.append(f"({feedback.lower().replace('_', ' ')})")
             if lf_parts:
-                lines.append(f"  Load Focus: {', '.join(lf_parts)}")
+                lines.append(f"  Load Focus (monthly load): {', '.join(lf_parts)}")
 
     # ── Training Load / ACWR ──
     tl = data.get("training_load")
@@ -939,3 +1104,109 @@ def format_garmin_data(data: dict, units: str = "imperial") -> str:
                     lines.append(f"      Lap {lap['lap']}: {lap_details}")
 
     return "\n".join(lines) if lines else "No Garmin data available."
+
+
+def format_garmin_body_state(data: dict, units: str = "imperial") -> str:
+    """
+    Condensed readiness snapshot — sleep summary, HRV, RHR, body battery,
+    stress, training readiness, training status, and ACWR only.
+    No activity lap data. Used for today_readiness_check and post_workout_checkin
+    where activity detail is irrelevant and would waste context.
+    """
+    config = load_config()
+    lines = []
+
+    # Sleep — summary line only (no per-night detail)
+    if "sleep" in data and isinstance(data["sleep"], list) and data["sleep"]:
+        s_data = data["sleep"]
+        lines.append(f"Sleep trend: {_sleep_trend_summary(s_data)}")
+        last = s_data[0]
+        total_hrs = round(last["total_seconds"] / 3600, 1) if last.get("total_seconds") else "?"
+        deep = round(last["deep_seconds"] / 3600, 1) if last.get("deep_seconds") else "?"
+        rem = round(last["rem_seconds"] / 3600, 1) if last.get("rem_seconds") else "?"
+        lines.append(f"  Last night: {total_hrs}h total | score={last.get('score', '?')} | deep={deep}h | REM={rem}h")
+        resp_flags = [s for s in s_data if s.get("avg_respiration") and s["avg_respiration"] > 18]
+        spo2_flags = [s for s in s_data if s.get("avg_spo2") and s["avg_spo2"] < 95]
+        if resp_flags:
+            lines.append(f"  ⚠ Elevated respiration: {', '.join(s['date'] for s in resp_flags[:2])}")
+        if spo2_flags:
+            lines.append(f"  ⚠ Low SpO2: {', '.join(s['date'] for s in spo2_flags[:2])}")
+
+    # Waking vitals
+    ts = data.get("today_summary") or {}
+    waking_resp = ts.get("avg_waking_respiration")
+    avg_spo2 = ts.get("avg_spo2")
+    if waking_resp is not None or avg_spo2 is not None:
+        parts = []
+        if waking_resp is not None:
+            parts.append(f"waking resp={waking_resp:.1f} br/min" + (" ⚠" if waking_resp > 18 else ""))
+        if avg_spo2 is not None:
+            parts.append(f"avg SpO2={avg_spo2:.1f}%" + (" ⚠" if avg_spo2 < 95 else ""))
+        lines.append(f"Today's waking vitals: {' | '.join(parts)}")
+
+    # HRV — latest + 10-day avg only
+    if "hrv" in data and isinstance(data["hrv"], list) and data["hrv"]:
+        lines.append(f"HRV: {_hrv_trend_summary(data['hrv'])}")
+
+    # Resting HR — latest + avg only
+    if "resting_hr" in data and isinstance(data["resting_hr"], list) and data["resting_hr"]:
+        rhr_list = data["resting_hr"]
+        vals = [r["rhr"] for r in rhr_list]
+        avg_rhr = sum(vals) / len(vals)
+        latest = vals[0]
+        delta = latest - avg_rhr
+        direction = "↑ elevated" if delta > 2 else ("↓ low" if delta < -2 else "→ normal")
+        lines.append(f"Resting HR: latest={latest} bpm | {len(vals)}-day avg={avg_rhr:.0f} bpm | {direction}")
+
+    # Body battery — today only
+    if "body_battery" in data and isinstance(data["body_battery"], list) and data["body_battery"]:
+        bb = data["body_battery"][0]
+        wake_val = ts.get("body_battery_wake") or bb.get("start", "?")
+        now_val = ts.get("body_battery_now") or bb.get("end", "?")
+        high_val = ts.get("body_battery_high")
+        bb_line = f"Body Battery: wake={wake_val} | current={now_val}"
+        if high_val is not None:
+            bb_line += f" | daily_high={high_val}"
+        lines.append(bb_line)
+
+    # Stress — today only
+    if "stress" in data and isinstance(data["stress"], list) and data["stress"]:
+        st = data["stress"][0]
+        avgs = [s["average"] for s in data["stress"] if s.get("average") is not None]
+        rolling = f" | {len(avgs)}-day avg={sum(avgs)/len(avgs):.0f}" if avgs else ""
+        lines.append(f"Stress: avg={st.get('average', '?')} | max={st.get('max', '?')}{rolling}")
+
+    # Training Readiness — today only
+    if "training_readiness" in data and isinstance(data["training_readiness"], list) and data["training_readiness"]:
+        tr = data["training_readiness"][0]
+        tr_line = f"Training Readiness: score={tr.get('score', '?')}"
+        if tr.get("level"):
+            tr_line += f" ({tr['level']})"
+        lines.append(tr_line)
+
+    # Training Status + ACWR
+    ts_data = data.get("training_status")
+    if ts_data and isinstance(ts_data, dict):
+        parts = []
+        if ts_data.get("status"):
+            parts.append(f"status={ts_data['status']}")
+        if ts_data.get("recovery_hours") is not None:
+            parts.append(f"recovery time={ts_data['recovery_hours']}h")
+        if parts:
+            lines.append(f"Training Status: {' | '.join(parts)}")
+
+    tl = data.get("training_load")
+    if tl and isinstance(tl, dict):
+        tl_parts = []
+        if tl.get("acute") is not None:
+            tl_parts.append(f"acute={tl['acute']:.0f}")
+        if tl.get("chronic") is not None:
+            tl_parts.append(f"chronic={tl['chronic']:.0f}")
+        if tl.get("acwr") is not None:
+            acwr = tl["acwr"]
+            flag = "↓ undertraining" if acwr < 0.8 else ("↑↑ high injury risk" if acwr > 1.5 else ("↑ elevated" if acwr > 1.3 else "optimal"))
+            tl_parts.append(f"ACWR={acwr:.2f} ({flag})")
+        if tl_parts:
+            lines.append(f"Training Load: {' | '.join(tl_parts)}")
+
+    return "\n".join(lines) if lines else "No body state data available."

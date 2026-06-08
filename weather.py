@@ -2,6 +2,8 @@
 Fetches historical weather conditions for a given location and time using Open-Meteo.
 Free API, no key required. Used to provide context for run effort interpretation.
 """
+from __future__ import annotations
+
 import urllib.request
 import json
 from datetime import datetime, timezone

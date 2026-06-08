@@ -143,20 +143,18 @@ def audit_formatted(garmin_formatted: str):
     checks = [
         ("Sleep trend", "Sleep trend:"),
         ("Respiration data", "resp="),
-        ("SpO2 data", "SpO2="),
-        ("Respiration flag", "⚠ Elevated respiration"),
+        ("Waking vitals block", "Today's waking vitals:"),
         ("HRV trend", "HRV:"),
         ("Resting HR", "Resting HR:"),
         ("Body battery", "Body Battery"),
+        ("Body battery wake value", "wake="),
         ("Body battery trend", "Body battery 7-day trend"),
         ("Stress", "Stress (today)"),
         ("Training readiness", "Training Readiness"),
         ("VO2 max", "VO2 Max"),
-        ("Lactate threshold", "Lactate Threshold"),
         ("Training status", "Training Status"),
         ("Training load / ACWR", "Training Load"),
         ("Load focus", "Load Focus"),
-        ("Steps", "Steps:"),
         ("Activity entries", "Recent activities"),
         ("Load distribution", "Load distribution"),
         ("Activity pattern", "Activity pattern"),
@@ -165,8 +163,12 @@ def audit_formatted(garmin_formatted: str):
         ("Running dynamics", "Running dynamics"),
         ("GCT in laps", "GCT="),
         ("Stride length in laps", "stride="),
-        ("HR zones", "HR zones"),
         ("Weather", "weather:"),
+        # Device-dependent (may be ✗ if hardware doesn't support):
+        ("SpO2 data [device-dependent]", "SpO2="),
+        ("HR zones [needs LT HR]", "HR zones"),
+        ("Steps [if enabled]", "Steps:"),
+        ("Lactate threshold [device-dependent]", "Lactate Threshold"),
     ]
 
     found = sum(1 for _, marker in checks if marker in garmin_formatted)
@@ -214,14 +216,18 @@ def audit_supporting_data():
         print(f"    Athlete feedback: {'✓' if has_feedback else '✗ (none logged yet today)'}")
 
 
-def show_prompt(prompt_name: str, garmin_formatted: str):
+def show_prompt(prompt_name: str, garmin_formatted: str, body_state: str = ""):
     """Build and print the full user_prompt for a specific function."""
     import notes
     import daily_log
     import claude
 
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
     config = notes.load_config()
-    plan = notes.read_plan()
+    tz = ZoneInfo(config["schedule"]["timezone"])
+    weekday = datetime.now(tz).strftime("%A")
+    plan_context = notes.parse_plan_context(notes.read_plan(), weekday)
     coach_notes = notes.read_notes()
     profile = notes.read_profile()
     reflection = notes.read_weekly_reflection()
@@ -244,27 +250,27 @@ def show_prompt(prompt_name: str, garmin_formatted: str):
 
     try:
         if prompt_name == "daily_update":
-            claude.daily_update(garmin_formatted, plan, coach_notes, profile,
+            claude.daily_update(garmin_formatted, plan_context, coach_notes, profile,
                                 recent_logs=recent_logs, weekly_reflection=reflection)
         elif prompt_name == "evening_checkin":
-            claude.evening_checkin(garmin_formatted, plan, coach_notes, profile,
+            claude.evening_checkin(garmin_formatted, plan_context, coach_notes, profile,
                                    recent_logs=recent_logs, weekly_reflection=reflection)
         elif prompt_name == "today_readiness_check":
-            claude.today_readiness_check(plan, coach_notes, profile,
-                                         garmin_formatted=garmin_formatted,
+            claude.today_readiness_check(plan_context, coach_notes, profile,
+                                         garmin_formatted=body_state or garmin_formatted,
                                          recent_logs=recent_logs, weekly_reflection=reflection)
         elif prompt_name == "post_workout_checkin":
             sample_summary = "Morning Run: 3.0 mi | time 28:00 | avg pace 9:20/mi | avg HR 152 | aerobic TE 2.4"
             claude.post_workout_checkin(sample_summary, coach_notes, profile,
-                                        garmin_formatted=garmin_formatted,
-                                        training_plan=plan, recent_logs=recent_logs,
+                                        garmin_formatted=body_state or garmin_formatted,
+                                        plan_context=plan_context, recent_logs=recent_logs,
                                         weekly_reflection=reflection)
         elif prompt_name == "respond_to_user":
-            claude.respond_to_user("How am I doing this week?", plan, coach_notes, profile,
+            claude.respond_to_user("How am I doing this week?", plan_context, coach_notes, profile,
                                    garmin_formatted=garmin_formatted,
                                    weekly_reflection=reflection, recent_logs=recent_logs)
         elif prompt_name == "weekly_reflection":
-            claude.generate_weekly_reflection(garmin_formatted, plan, coach_notes, profile,
+            claude.generate_weekly_reflection(garmin_formatted, plan_context, coach_notes, profile,
                                               recent_logs=recent_logs, week_label="Week of Jun 2–8, 2026",
                                               weekly_reflection=reflection)
         else:
@@ -283,6 +289,64 @@ def show_prompt(prompt_name: str, garmin_formatted: str):
         print("Failed to capture prompt.")
 
 
+def diagnose_garmin_apis():
+    """
+    Make raw API calls to each failing metric endpoint and print the raw response.
+    Use this to understand what Garmin is actually returning vs what we expect.
+    Requires valid GARMIN_EMAIL / GARMIN_PASSWORD in .env.
+    """
+    import os
+    from datetime import date, timedelta
+    from garminconnect import Garmin
+
+    email = os.getenv("GARMIN_EMAIL")
+    password = os.getenv("GARMIN_PASSWORD")
+    if not email or not password:
+        print("[error] GARMIN_EMAIL / GARMIN_PASSWORD not set")
+        return
+
+    print("\nLogging into Garmin Connect...")
+    try:
+        client = Garmin(email, password)
+        client.login()
+    except Exception as e:
+        print(f"[error] Login failed: {e}")
+        return
+
+    today = date.today().isoformat()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    def probe(label, fn, *args):
+        print(f"\n{'─'*50}")
+        print(f"API: {label}({', '.join(str(a) for a in args)})")
+        try:
+            result = fn(*args)
+            text = json.dumps(result, indent=2) if result is not None else "None"
+            # Truncate long responses
+            if len(text) > 800:
+                text = text[:800] + f"\n... [{len(text)} chars total, truncated]"
+            print(text)
+        except Exception as e:
+            print(f"[exception] {type(e).__name__}: {e}")
+
+    probe("get_hrv_data", client.get_hrv_data, yesterday)
+    probe("get_rhr_day (today)", client.get_rhr_day, today)
+    probe("get_rhr_day (yesterday)", client.get_rhr_day, yesterday)
+    probe("get_body_battery (today)", client.get_body_battery, today)
+    probe("get_stress_data (today)", client.get_stress_data, today)
+    probe("get_max_metrics", client.get_max_metrics, today)
+    for method_name in ("get_lactate_threshold", "get_training_status", "get_training_load"):
+        method = getattr(client, method_name, None)
+        if method is None:
+            print(f"\n{'─'*50}")
+            print(f"API: {method_name} — NOT AVAILABLE in this garminconnect version")
+        else:
+            if method_name == "get_lactate_threshold":
+                probe(method_name, method)
+            else:
+                probe(method_name, method, today)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -292,10 +356,16 @@ def main():
 
     parser = argparse.ArgumentParser(description="Debug relay data pipeline")
     parser.add_argument("--fetch", action="store_true", help="Force fresh Garmin fetch (requires credentials)")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="Make raw API calls to each failing endpoint and print responses")
     parser.add_argument("--prompt", metavar="NAME",
                         help="Show full assembled prompt for: daily_update, evening_checkin, "
                              "today_readiness_check, post_workout_checkin, respond_to_user, weekly_reflection")
     args = parser.parse_args()
+
+    if args.diagnose:
+        diagnose_garmin_apis()
+        return
 
     import garmin
 
@@ -315,18 +385,23 @@ def main():
 
     import notes as notes_module
     config = notes_module.load_config()
-    garmin_formatted = garmin.format_garmin_data(data, units=config["coaching"]["units"])
+    units = config["coaching"]["units"]
+    garmin_formatted = garmin.format_garmin_data(data, units=units)
+    body_state = garmin.format_garmin_body_state(data, units=units)
 
     audit_formatted(garmin_formatted)
     audit_supporting_data()
 
     if args.prompt:
-        show_prompt(args.prompt, garmin_formatted)
+        show_prompt(args.prompt, garmin_formatted, body_state=body_state)
     else:
         print("\n" + "="*60)
         print("TIP: Run with --prompt <name> to see full assembled prompt")
         print("  e.g. python debug_data.py --prompt daily_update")
         print("       python debug_data.py --prompt evening_checkin")
+        print()
+        print("     Run with --diagnose to see raw Garmin API responses")
+        print("  e.g. python debug_data.py --diagnose")
         print("="*60)
 
 

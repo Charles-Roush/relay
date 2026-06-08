@@ -24,9 +24,12 @@ paths:
   plan_file: "training_plan.md"
   profile_file: "athlete_profile.md"
   weekly_reflection_file: "weekly_reflection.md"
+  fitness_history_file: "logs/fitness_history.json"  # Rolling VO2/status trend log
 
 garmin:
   lookback_days: 10              # Days of history to pull for all metrics; activities fetched to match
+  lactate_threshold_hr: null     # Set manually if known (e.g. 168). Enables HR zone computation.
+                                 # Run a Garmin LT test or use ~95% of recent 30-min race average HR.
   weather:
     enabled: true                # Fetch Open-Meteo weather for recent activities (free, no API key)
   metrics:                       # Toggle which data points to pull

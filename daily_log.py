@@ -1,14 +1,36 @@
+from __future__ import annotations
+
 """
 Permanent per-day activity and coaching log.
 One file per day in logs/YYYY-MM-DD.md — never expires, never overwritten.
 Claude reads recent entries as long-term context.
 """
 
+import fcntl
 import re
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
 import yaml
+
+
+@contextmanager
+def _file_lock(path: Path):
+    """Exclusive advisory lock on a file while writing. No-op if fcntl unavailable."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(exist_ok=True)
+    lock_file = lock_path.open("w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 _METRICS_BLOCK = re.compile(r'## Metrics\n\n```.*?```\n\n', re.DOTALL)
 
@@ -44,44 +66,46 @@ def write_daily_log(
     ensure_logs_dir()
     path = _log_path(log_date)
 
-    if path.exists():
+    with _file_lock(path):
+        if path.exists():
+            if feedback_notes:
+                with path.open("a") as f:
+                    f.write("\n### Athlete Feedback\n")
+                    for note in feedback_notes:
+                        f.write(f"- {note}\n")
+            return
+
+        feedback_section = ""
         if feedback_notes:
-            with path.open("a") as f:
-                f.write("\n### Athlete Feedback\n")
-                for note in feedback_notes:
-                    f.write(f"- {note}\n")
-        return
+            note_lines = "\n".join(f"- {n}" for n in feedback_notes)
+            feedback_section = f"\n### Athlete Feedback\n{note_lines}\n"
 
-    feedback_section = ""
-    if feedback_notes:
-        lines = "\n".join(f"- {n}" for n in feedback_notes)
-        feedback_section = f"\n### Athlete Feedback\n{lines}\n"
+        content = (
+            f"# {log_date.strftime('%A, %B %d %Y')}\n\n"
+            f"## Metrics\n\n"
+            f"```\n{garmin_formatted}\n```\n\n"
+            f"## Coach Analysis\n\n"
+            f"{coaching_message}\n"
+            f"{feedback_section}"
+        )
 
-    content = (
-        f"# {log_date.strftime('%A, %B %d %Y')}\n\n"
-        f"## Metrics\n\n"
-        f"```\n{garmin_formatted}\n```\n\n"
-        f"## Coach Analysis\n\n"
-        f"{coaching_message}\n"
-        f"{feedback_section}"
-    )
-
-    path.write_text(content)
+        path.write_text(content)
 
 
 def append_feedback_to_log(log_date: date, feedback: str):
     """Append a single feedback entry to today's log (called from bot commands)."""
     ensure_logs_dir()
     path = _log_path(log_date)
-    if path.exists():
-        with path.open("a") as f:
-            f.write(f"- [FEEDBACK] {feedback}\n")
-    else:
-        path.write_text(
-            f"# {log_date.strftime('%A, %B %d %Y')}\n\n"
-            f"## Athlete Feedback\n\n"
-            f"- [FEEDBACK] {feedback}\n"
-        )
+    with _file_lock(path):
+        if path.exists():
+            with path.open("a") as f:
+                f.write(f"- [FEEDBACK] {feedback}\n")
+        else:
+            path.write_text(
+                f"# {log_date.strftime('%A, %B %d %Y')}\n\n"
+                f"## Athlete Feedback\n\n"
+                f"- [FEEDBACK] {feedback}\n"
+            )
 
 
 def read_recent_logs(n_days: int = 30) -> str:

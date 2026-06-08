@@ -1,8 +1,44 @@
+from __future__ import annotations
+
+import fcntl
 import re
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
+_DAY_ABBRS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+_WEEKDAY_TO_ABBR = {
+    "Monday": "Mon", "Tuesday": "Tue", "Wednesday": "Wed",
+    "Thursday": "Thu", "Friday": "Fri", "Saturday": "Sat", "Sunday": "Sun",
+}
+
+_MONTH_MAP = {
+    "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
+    "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+
 import yaml
+
+
+@contextmanager
+def _file_lock(path: Path):
+    """Exclusive advisory lock on a file while writing."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(exist_ok=True)
+    lock_file = lock_path.open("w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+        try:
+            lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 _PROFILE_TEMPLATE = """\
 ## Athlete Profile
@@ -83,13 +119,16 @@ def read_weekly_reflection() -> str:
 
 def write_profile(content: str):
     f = _profile_file()
-    f.write_text(content if content.endswith("\n") else content + "\n")
+    with _file_lock(f):
+        f.write_text(content if content.endswith("\n") else content + "\n")
 
 
 def append_to_profile(text: str):
     """Append a raw line to the profile (used for PR logging etc.)."""
-    content = read_profile().rstrip()
-    _profile_file().write_text(content + "\n" + text + "\n")
+    f = _profile_file()
+    with _file_lock(f):
+        content = read_profile().rstrip()
+        f.write_text(content + "\n" + text + "\n")
 
 
 def write_notes(content: str):
@@ -133,17 +172,19 @@ def write_notes(content: str):
         filtered = filtered[-max_lines:]
 
     rebuilt = "## Coach Notes\n\n" + "\n".join(filtered) + "\n"
-    _notes_file().write_text(rebuilt)
+    f = _notes_file()
+    with _file_lock(f):
+        f.write_text(rebuilt)
 
 
 def write_weekly_reflection(content: str):
     """Append a dated weekly reflection entry."""
     f = _weekly_reflection_file()
-    existing = f.read_text() if f.exists() else _WEEKLY_REFLECTION_HEADER
-    # Ensure header exists
-    if not existing.startswith("## Weekly Reflections"):
-        existing = _WEEKLY_REFLECTION_HEADER + existing
-    f.write_text(existing.rstrip() + "\n\n" + content.strip() + "\n")
+    with _file_lock(f):
+        existing = f.read_text() if f.exists() else _WEEKLY_REFLECTION_HEADER
+        if not existing.startswith("## Weekly Reflections"):
+            existing = _WEEKLY_REFLECTION_HEADER + existing
+        f.write_text(existing.rstrip() + "\n\n" + content.strip() + "\n")
 
 
 def append_feedback_note(text: str):
@@ -199,6 +240,90 @@ def apply_updates(updated_notes: str, updated_profile: str):
     if updated_profile:
         write_profile(updated_profile)
     # updated_plan is intentionally never applied — training_plan.md is read-only
+
+
+def _extract_week_table(block: str) -> str:
+    """Extract the week header line + markdown table from a week block."""
+    lines = block.strip().splitlines()
+    result = []
+    in_table = False
+    for line in lines:
+        if line.startswith("## Week"):
+            result.append(line)
+        elif line.startswith("|"):
+            in_table = True
+            result.append(line)
+        elif in_table:
+            break
+    return "\n".join(result)
+
+
+def _get_plan_session(block: str, day_abbr: str) -> str:
+    m = re.search(rf'\|\s*{re.escape(day_abbr)}\s*\|\s*(.+?)\s*\|', block)
+    return m.group(1).strip() if m else "Rest"
+
+
+def parse_plan_context(plan_text: str, weekday: str) -> dict:
+    """
+    Parse today's and tomorrow's sessions from the training plan.
+    weekday: full weekday name e.g. "Monday"
+    Returns {"today": str, "tomorrow": str, "week_block": str}
+    """
+    today = date.today()
+    day_abbr = _WEEKDAY_TO_ABBR.get(weekday, weekday[:3])
+
+    week_blocks = re.split(r'\n---\n', plan_text)
+
+    current_block = None
+    current_block_idx = None
+
+    for i, block in enumerate(week_blocks):
+        m = re.search(r'## Week \d+ — (\w+)\s+(\d+)', block)
+        if not m:
+            continue
+        month_num = _MONTH_MAP.get(m.group(1))
+        if not month_num:
+            continue
+        start_day = int(m.group(2))
+        year = today.year
+        try:
+            week_start = date(year, month_num, start_day)
+        except ValueError:
+            continue
+        if (today - week_start).days > 200:
+            try:
+                week_start = date(year + 1, month_num, start_day)
+            except ValueError:
+                continue
+        if week_start <= today <= week_start + timedelta(days=6):
+            current_block = block
+            current_block_idx = i
+            break
+
+    if current_block is None:
+        for i, block in enumerate(week_blocks):
+            if "| Day | Session |" in block:
+                current_block = block
+                current_block_idx = i
+                break
+
+    if current_block is None:
+        return {"today": "See plan", "tomorrow": "See plan", "week_block": plan_text[:800]}
+
+    today_session = _get_plan_session(current_block, day_abbr)
+
+    today_idx = _DAY_ABBRS.index(day_abbr) if day_abbr in _DAY_ABBRS else 0
+    tomorrow_idx = (today_idx + 1) % 7
+    tomorrow_abbr = _DAY_ABBRS[tomorrow_idx]
+    if tomorrow_idx == 0 and current_block_idx is not None and current_block_idx + 1 < len(week_blocks):
+        tomorrow_block = week_blocks[current_block_idx + 1]
+    else:
+        tomorrow_block = current_block
+
+    tomorrow_session = _get_plan_session(tomorrow_block, tomorrow_abbr)
+    week_block = _extract_week_table(current_block)
+
+    return {"today": today_session, "tomorrow": tomorrow_session, "week_block": week_block}
 
 
 def set_config_value(key_path: str, value) -> bool:
