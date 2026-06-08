@@ -1,7 +1,22 @@
 schedule:
-  hour: 9                        # Local hour to send daily update (24hr)
-  weekly_reflection_hour: 20     # Hour on Sunday evening to generate weekly reflection
   timezone: "US/Eastern"
+
+  daily_update:
+    hour: 9                      # Local hour (24hr) to send the morning coaching update
+    minute: 0
+
+  weekly_reflection:
+    day_of_week: "sun"           # Day to generate + send the weekly report
+    hour: 20                     # Local hour
+    minute: 0
+
+  evening_checkin:
+    hour: 20                     # Local hour to send the nightly plan-vs-actual review
+    minute: 0
+    enabled: true                # Set false to disable without removing the schedule entry
+
+  activity_check:
+    interval_minutes: 60         # How often to poll Garmin for new workouts (post-workout check-in)
 
 paths:
   logs_dir: "logs"
@@ -11,34 +26,50 @@ paths:
   weekly_reflection_file: "weekly_reflection.md"
 
 garmin:
-  lookback_days: 10          # How many days of history to pull
-  activities_count: 10       # How many recent activities to include
-  metrics:                   # Toggle which data points to pull
+  lookback_days: 10              # Days of history to pull for all metrics; activities fetched to match
+  weather:
+    enabled: true                # Fetch Open-Meteo weather for recent activities (free, no API key)
+  metrics:                       # Toggle which data points to pull
     sleep: true
     hrv: true
+    resting_hr: true
     body_battery: true
-    steps: false
     stress: true
+    training_readiness: true
+    vo2max: true
+    lactate_threshold: true
+    training_status: true        # Training Status label, Recovery Time, Load Focus
+    training_load: true          # Acute load, chronic load, ACWR
+    steps: false
     activities: true
 
 claude:
   model: "claude-sonnet-4-6"
   max_tokens: 4000
   daily_update:
-    max_sentences: 15        # Max length of morning summary
-    tone: "direct"           # direct | encouraging | detailed
-  daily_logs_days: 30        # Days of training history logs to include in daily update
-  load_trend_days: 14        # Days used for easy/moderate/hard load trend analysis
+    max_sentences: 12            # Approximate length cap for morning update
+    tone: "direct"               # direct | encouraging | detailed
+  evening_checkin:
+    max_sentences: 6             # Hard cap on evening check-in length
+  respond:
+    max_sentences: 8             # Cap for conversational replies
+  daily_logs_days: 30            # Days of training history logs passed to Claude
+  load_trend_days: 14            # Days used for easy/moderate/hard load trend analysis
   coach_notes:
-    max_lines: 20            # Max notes to keep at once
-    expiry_days: 21          # Auto-remove notes older than this
+    max_lines: 20                # Max note lines to keep at once
+    expiry_days: 21              # Auto-remove notes older than this
 
 coaching:
-  sport: "running"           # running | cycling | triathlon | general
-  units: "imperial"          # imperial | metric
-  focus: "Follow training"   # Informs Claude's recommendations — free text
-  goal: "Late october 5k"    # Current goal — free text
-  post_workout_checkin: true # Proactively ask how a workout felt after detecting new activity
+  sport: "running"               # running | cycling | triathlon | general
+  units: "imperial"              # imperial | metric
+  focus: "Follow training"       # Informs Claude's recommendations — free text
+  goal: "Late october 5k"        # Current race/training goal — free text
+  post_workout_checkin: true     # Send a check-in message after detecting a new workout
 
 history:
-  max_messages: 20           # Max conversation messages to retain per session (10 exchanges)
+  max_messages: 20               # Max conversation turns to keep in memory per session
+
+debug:
+  enabled: false                 # Log full prompts sent to Claude (system + user) before each API call
+  log_to_file: true              # Write debug output to logs/debug_prompts.log
+  dry_run: false                 # If true, skip the actual API call and return a placeholder response

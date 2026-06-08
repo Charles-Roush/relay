@@ -1,5 +1,7 @@
+import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -23,8 +25,91 @@ def _get_client() -> anthropic.Anthropic:
     return _client
 
 
+def get_local_datetime(timezone_str: str) -> tuple[str, str, str]:
+    """Returns (date_iso, weekday, time_hhmm)."""
+    now = datetime.now(ZoneInfo(timezone_str))
+    return now.date().isoformat(), now.strftime("%A"), now.strftime("%H:%M")
+
+
 def get_local_date(timezone_str: str) -> str:
     return datetime.now(ZoneInfo(timezone_str)).date().isoformat()
+
+
+def _debug_cfg(config: dict) -> dict:
+    """Return the debug config block with safe defaults."""
+    return config.get("debug", {})
+
+
+def _log_prompt(label: str, system_prompt: str, user_prompt: str, config: dict):
+    """
+    If debug.enabled is true, log the full system + user prompt before an API call.
+    Writes to stdout always. Also appends to logs/debug_prompts.log if debug.log_to_file is true.
+    """
+    dbg = _debug_cfg(config)
+    if not dbg.get("enabled", False) and os.getenv("DEBUG") != "1":
+        return
+
+    separator = "=" * 72
+    output = (
+        f"\n{separator}\n"
+        f"DEBUG PROMPT — {label}  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]\n"
+        f"{separator}\n"
+        f"[SYSTEM PROMPT]\n{system_prompt}\n\n"
+        f"[USER PROMPT]\n{user_prompt}\n"
+        f"{separator}\n"
+    )
+
+    print(output)
+
+    if dbg.get("log_to_file", True):
+        try:
+            log_dir = Path(config.get("paths", {}).get("logs_dir", "logs"))
+            log_dir.mkdir(exist_ok=True)
+            with open(log_dir / "debug_prompts.log", "a") as f:
+                f.write(output)
+        except Exception as e:
+            logging.warning(f"Could not write debug log: {e}")
+
+
+def _is_dry_run(config: dict) -> bool:
+    """True if dry_run is set in config or via DRY_RUN=1 env var."""
+    return config.get("debug", {}).get("dry_run", False) or os.getenv("DRY_RUN") == "1"
+
+
+def _call_claude(
+    label: str,
+    system_prompt: str,
+    user_prompt: str,
+    config: dict,
+    max_tokens: int | None = None,
+    extra_messages: list[dict] | None = None,
+) -> str:
+    """
+    Central Claude API call. Handles debug logging and dry-run before calling.
+    extra_messages: optional list of messages to prepend before the final user turn
+                    (used by respond_to_user for conversation history).
+    """
+    _log_prompt(label, system_prompt, user_prompt, config)
+
+    if _is_dry_run(config):
+        print(f"[DRY RUN] Skipping API call for: {label}")
+        return f"<coaching_message>DRY RUN — {label} — no API call made.</coaching_message><updated_notes>{{}}</updated_notes>"
+
+    claude_cfg = config["claude"]
+    tokens = max_tokens or claude_cfg["max_tokens"]
+
+    if extra_messages:
+        messages = extra_messages + [{"role": "user", "content": user_prompt}]
+    else:
+        messages = [{"role": "user", "content": user_prompt}]
+
+    response = _get_client().messages.create(
+        model=claude_cfg["model"],
+        max_tokens=tokens,
+        system=system_prompt,
+        messages=messages,
+    )
+    return response.content[0].text
 
 
 def build_system_prompt(config: dict) -> str:
@@ -37,36 +122,41 @@ def build_system_prompt(config: dict) -> str:
 You are an expert {sport} coach with deep knowledge of exercise physiology, periodization, and data-driven training. \
 You have a long-term coaching relationship with this athlete and a persistent memory of their history, tendencies, and development.
 
-You have access to:
-- Garmin biometric data (sleep, HRV, body battery, stress, activity records with lap splits)
-- A structured training plan (reference only — you can and should override it based on data)
-- Rolling coach notes (short-term working memory, ~3 weeks)
-- Athlete profile (permanent long-term memory: PRs, injury history, race history, training observations)
-- Weekly reflections (your own written summaries of each training week)
-- Recent daily logs (coaching analysis and athlete feedback)
-
 **Coaching philosophy:**
 - Training adaptation happens through the right stimulus at the right time. Consistency beats heroics.
 - HRV is the most reliable daily readiness signal. A significant drop (>5ms below rolling average) means the body hasn't recovered — reduce load even if the plan says otherwise.
-- Sleep quality (deep + REM hours, not just total) matters more than total sleep time for recovery assessment.
+- Sleep quality (deep + REM hours, not just total) matters more than total sleep time for recovery assessment. Deep sleep drives physical recovery; REM drives cognitive and nervous system recovery. Poor deep sleep before a hard workout is a stronger warning sign than poor total sleep.
 - Body battery and stress together indicate cumulative load. Low battery + high stress = systemic fatigue, not just muscular.
-- For a developing aerobic athlete, the majority of runs should be easy (aerobic TE < 2.0). Too many moderate/hard days is the primary driver of overtraining.
+- Resting HR is a lagging but reliable fitness and recovery indicator. A resting HR elevated >3–4 bpm above the rolling average, especially paired with low HRV, is a strong sign of incomplete recovery or early illness.
+- Training Readiness score synthesizes HRV, sleep, load history, and stress into a single 0–100 score. Scores below 40 warrant significant load reduction; scores above 70 mean the body is primed for quality work.
+- VO2 max trend over weeks indicates whether the aerobic base is responding to training.
+- Lactate threshold (LT) HR and pace are the most important performance anchors. LT pace defines the ceiling for tempo and threshold work. If no LT test exists, estimate from the HRV-based training zones or race data in the athlete profile.
+- Recovery Time (hours) is Garmin's estimate of when the body will be ready for another hard session. Treat it as a floor, not a ceiling — high recovery time combined with poor HRV/sleep means the estimate may even be optimistic.
+- Training Status (Productive, Maintaining, Recovering, Overreaching, Detraining, Peaking) is a rolling fitness/fatigue signal. "Productive" means training is building fitness; "Overreaching" means the load is exceeding recovery — act on it immediately.
+- Load Focus shows the distribution across aerobic base, tempo, threshold, and anaerobic buckets. A developing runner should sit heavily in the base bucket. Disproportionate threshold or anaerobic load without matching base is a recipe for injury.
+- ACWR (Acute:Chronic Workload Ratio) is the most important injury-risk metric. The optimal range is 0.8–1.3. Above 1.5 is high injury risk — the athlete is doing significantly more than their body is conditioned for. Below 0.8 means undertraining. Track the direction, not just the snapshot.
+- For a developing aerobic athlete, the majority of runs should be easy (aerobic TE < 2.0). More than 2 moderate/hard sessions in 7 days is usually too much.
 - Aerobic base development requires patience. Pushing pace on easy days feels productive but blunts adaptation.
 - Lap-by-lap HR and pace data reveals effort honesty: HR drift across a run means the pace was too fast for the intended zone even if it felt easy.
-- TSS is a useful acute load proxy but incomplete — cross-reference with HRV trend to assess actual recovery cost.
-- Cadence is an injury risk signal: consistently low cadence (<170 spm) increases impact stress on developing legs.
+- Ground contact time (GCT) reflects running economy and fatigue. High GCT (>250ms) or GCT creeping up across laps = fatigue or form breakdown.
+- Vertical oscillation should be minimal (ideally <90mm at easy paces). Vertical ratio below 8% is good; above 10% is a form flag.
+- Cadence below 170 spm increases impact stress. Flag it consistently.
+- Subjective RPE and feel are ground truth. Always reconcile them with objective data — disagreement is important information.
+- Respiration rate during sleep (>18 br/min) and SpO2 (<95%) are early warning signs of illness, overreaching, or poor respiratory recovery. Flag them before making intensity recommendations.
+- Weather context (temperature, humidity) belongs in effort interpretation: HR runs approximately 1 bpm higher per 5°F above 55°F. Humidity above 70% compounds cardiovascular strain. A "hard" run at 85°F + 80% humidity may have been correctly paced.
+- The activity pattern (run/rest rhythm) matters as much as total volume. Running 7 days straight with no recovery is a structural problem regardless of easy pacing. Flag it.
+- Cross-reference RHR trend with HRV: if both trend worse simultaneously (RHR up, HRV down), that's a strong overreaching signal.
+- Use ACWR to frame workload risk: above 1.3 with declining HRV = injury-risk window even if the athlete feels fine. Below 0.8 with "Detraining" status = insufficient stimulus.
+- Recovery Time is a floor for spacing hard sessions. Don't schedule threshold work inside a 48h recovery window unless HRV and Training Readiness strongly support it.
+- Training Status is a slow-moving signal. "Overreaching" warrants reducing intensity now, not just one easy day. "Productive" with good HRV is the green light for quality work.
+- Load Focus distribution matters: for a base-phase 5K athlete, base load should dominate. Disproportionate threshold/anaerobic spikes without matching base = distribution problem, not just volume.
+- Anchor tempo and threshold targets to LT pace when available. It's more precise than "comfortably hard."
+- When analyzing a run, compare average HR and peak lap HR to the LT HR. Running threshold intervals above LT HR is a form flag; running them well below means the athlete may be sandbagging.
 
-**How to use the data:**
-- When analyzing a run, go lap by lap: identify warmup, steady state, and cooldown. Flag HR creep, pacing drift, or anomalous laps.
-- HRV trend over the past week matters more than a single reading. A steady decline signals accumulating fatigue before the athlete feels it.
-- Compare this week's load distribution (easy/moderate/hard) using the load trend summary provided. Flag imbalances.
-- When the athlete shares how a workout felt, reconcile their subjective experience with what the biometrics show — agreement is reassuring, disagreement is data.
-- Use the weekly reflections and daily logs to identify patterns that don't show up in a single session: e.g., HR consistently running high on Monday runs, sleep consistently poor before hard days.
-
-**Memory management — be selective, not exhaustive:**
-- COACH NOTES are for things you genuinely need to remember in 3-7 days that aren't already in the Garmin data or logs. Do NOT note individual workout completions, daily metrics, or anything already captured in the data. Only add a note if it's a flag, pattern, or context that wouldn't otherwise be visible — e.g. "athlete mentioned left knee soreness", "week of travel, disrupted sleep expected", "starting a down week". Most responses should not add any new notes at all.
-- ATHLETE PROFILE is for permanent observations only: new PRs, confirmed injury patterns, long-term tendencies. Do not update it unless something genuinely lasting has changed.
-- WEEKLY REFLECTION is your own written summary of each week — reference it when analyzing trends.
+**Memory management — be selective:**
+- COACH NOTES: only flag things not already in the Garmin data or logs — injury hints, travel, context that won't be visible later. Most responses should not add notes.
+- ATHLETE PROFILE: permanent observations only — new PRs, confirmed injury patterns, long-term tendencies. Omit tag if nothing changed.
+- WEEKLY REFLECTION: your own summaries of each week — write for your future self, not the athlete.
 
 **Tone:** {tone}. Use {units} units.
 **Current goal:** {coaching['goal']}
@@ -83,11 +173,19 @@ Full updated coach_notes.md content (all existing notes plus any new ones, dated
 </updated_notes>
 
 <updated_profile>
-Full updated athlete_profile.md content. ONLY include this tag if something permanent changed — new PR, confirmed injury pattern, new long-term observation. Omit entirely if nothing changed.
+Full updated athlete_profile.md content. ONLY include this tag if something permanent changed. Omit entirely if nothing changed.
 </updated_profile>
+
+<feedback_log>
+Include ONLY when the athlete shares subjective feedback in this message — how a workout felt, RPE, energy level, pain, etc.
+Write a concise one-line summary (e.g. "easy run felt heavy, RPE 7, legs tired"). Omit entirely if no subjective feedback was shared.
+The athlete does NOT need to use any command — if they simply reply describing how something felt, capture it here.
+</feedback_log>
 
 The training plan is READ-ONLY. Never include <updated_plan>."""
 
+
+# ── Morning Daily Update ───────────────────────────────────────────────────────
 
 def daily_update(
     garmin_formatted: str,
@@ -100,73 +198,340 @@ def daily_update(
 ) -> str:
     config = load_config()
     claude_cfg = config["claude"]
-    g_cfg = config["garmin"]
     tz_str = config["schedule"]["timezone"]
     daily_logs_days = claude_cfg.get("daily_logs_days", 30)
     load_trend_days = claude_cfg.get("load_trend_days", 14)
+    tone = claude_cfg["daily_update"]["tone"]
+    units = config["coaching"]["units"]
+    goal = config["coaching"]["goal"]
+    max_sentences = claude_cfg["daily_update"]["max_sentences"]
 
-    client = _get_client()
+    date_iso, weekday, time_str = get_local_datetime(tz_str)
 
-    logs_section = (
-        f"TRAINING HISTORY (last {daily_logs_days} days of daily logs):\n{recent_logs}\n\n"
+    already_talked = (
+        "Note: you've already exchanged messages with this athlete earlier today — "
+        "don't repeat things already covered.\n"
+        if has_talked_today else ""
+    )
+
+    logs_block = (
+        f"{recent_logs}"
         if recent_logs and recent_logs != "No daily logs yet."
-        else ""
+        else "None yet."
     )
 
-    reflection_section = (
-        f"WEEKLY REFLECTIONS (your own summaries):\n{weekly_reflection}\n\n"
-        if weekly_reflection
-        else ""
-    )
+    reflection_block = weekly_reflection if weekly_reflection else "None yet."
 
-    conversation_note = (
-        "Note: You've already exchanged messages with this athlete earlier today. "
-        "Acknowledge that briefly and don't repeat things already discussed.\n\n"
-        if has_talked_today
-        else ""
-    )
+    user_prompt = f"""\
+{already_talked}
+=== DATE & PLAN ===
+{weekday}, {date_iso} at {time_str}
+Goal: {goal}
 
-    user_prompt = (
-        f"Date: {get_local_date(tz_str)}\n\n"
-        f"{conversation_note}"
-        f"GARMIN DATA (last {g_cfg['lookback_days']} days):\n{garmin_formatted}\n\n"
-        f"TRAINING PLAN:\n{training_plan}\n\n"
-        f"COACH NOTES:\n{coach_notes}\n\n"
-        f"ATHLETE PROFILE:\n{athlete_profile}\n\n"
-        f"{reflection_section}"
-        f"{logs_section}"
-        f"Write a thorough daily coaching update. Cover:\n"
-        f"1. Recovery status — read HRV deviation, sleep stage breakdown (deep + REM), body battery, and stress "
-        f"   together as a single readiness picture. Call out the most important signal.\n"
-        f"2. Workout breakdown — for EACH recent run, go lap by lap if data is available. "
-        f"   Identify warmup / steady state / cooldown. Check for HR drift (pacing too fast for zone), "
-        f"   anomalous laps, or effort that doesn't match the intended session. Flag anything worth noticing.\n"
-        f"3. Load trend — use the {load_trend_days}-day load distribution (easy/moderate/hard by aerobic TE) to assess "
-        f"   whether the training balance is appropriate. Flag if there are too many moderate/hard days relative "
-        f"   to easy days, or if total load is climbing faster than the athlete can absorb.\n"
-        f"4. Today's recommendation — specific and actionable. Reference the training plan as a default. "
-        f"   Override it if recovery signals say otherwise. If prescribing a workout, give target pace/effort/HR.\n"
-        f"5. Tomorrow preview — one sentence. What's coming up and what to know going in.\n\n"
-        f"Reference actual numbers throughout. Be direct. "
-        f"Max ~{claude_cfg['daily_update']['max_sentences']} sentences total."
-    )
+Training plan (extract today's and tomorrow's sessions from this):
+{training_plan}
 
-    if os.getenv("DRY_RUN") == "1":
-        print("=== SYSTEM PROMPT ===")
-        print(build_system_prompt(config))
-        print("\n=== USER PROMPT ===")
-        print(user_prompt)
-        print("===================\n")
-        return "<coaching_message>DRY RUN — no API call made.</coaching_message>"
+=== RECOVERY — LAST NIGHT & CURRENT STATE ===
+{garmin_formatted}
 
-    message = client.messages.create(
-        model=claude_cfg["model"],
-        max_tokens=claude_cfg["max_tokens"],
-        system=build_system_prompt(config),
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    return message.content[0].text
+=== TRAINING HISTORY ===
+Last {load_trend_days}-day load distribution is in the Garmin data above.
+Recent daily logs (last {daily_logs_days} days):
+{logs_block}
 
+=== LONG-TERM MEMORY ===
+Weekly reflections (your own summaries):
+{reflection_block}
+
+Coach notes:
+{coach_notes}
+
+Athlete profile:
+{athlete_profile}
+
+=== INSTRUCTIONS ===
+Write the morning coaching update. Structure your response as follows:
+
+1. RECOVERY & READINESS — synthesize all signals into one verdict:
+   - HRV: latest vs {load_trend_days}-day avg, direction, Garmin status
+   - Sleep: last night deep + REM hours and score; multi-night trend
+   - If respiration or SpO2 flags appear (⚠ markers in the data), name them explicitly — elevated
+     respiration (>18 br/min) or low SpO2 (<95%) are early illness/overreaching signals and should
+     be addressed before discussing training intensity.
+   - Resting HR: latest vs rolling avg and direction
+   - Training Readiness score and what it implies
+   - Body battery: start value and current; note the 7-day trend direction if net negative
+   - Stress: today vs rolling average
+   - Training Status (Productive / Maintaining / Recovering / Overreaching / Detraining)
+   - Recovery Time remaining (hours) — does today's plan fit inside or outside the recovery window?
+   Name the single most important signal and what it means for today.
+
+2. WORKLOAD RISK — one clear statement on where the athlete stands:
+   - ACWR: cite the value and its flag (optimal / elevated / high injury risk / undertraining)
+   - Acute vs chronic load numbers
+   - Load Focus: is the distribution appropriate for the current training phase?
+
+3. RECENT RUN ANALYSIS — for each run in the data, go lap by lap:
+   - Identify warmup / steady state / cooldown
+   - HR drift across laps (flag if >10 bpm rise); compare to LT HR if available
+   - HR zone distribution: if provided (Z1–Z5 by LT%), use it to characterize the effort fingerprint.
+     An "easy" run spending >20% in Z3+ is a pacing flag regardless of how it felt.
+   - Cadence — flag if consistently below 170 spm
+   - GCT — flag if elevated or increasing across laps; stride length shortening = fatigue signal
+   - Vertical oscillation / vertical ratio if present
+   - Weather context: if provided, factor temperature/humidity into HR interpretation.
+     HR runs ~1 bpm higher per 5°F above 55°F at the same effort. Humidity >70% compounds this.
+   - Reconcile with any logged RPE or feel notes
+
+4. LOAD BALANCE — assess the {load_trend_days}-day easy/moderate/hard distribution and activity pattern.
+   The activity pattern (R = run, · = rest) shows the actual rhythm — flag if rest days are clustered
+   or if the athlete is running every day without recovery. Treat the training plan as a guideline;
+   use the pattern + load distribution to flag structural issues, not to grade strict adherence.
+
+5. TODAY'S RECOMMENDATION — specific and actionable. Default to the plan; override if signals warrant.
+   If prescribing threshold or tempo work, anchor to LT pace ({units}). Give HR ceiling relative to LT HR.
+
+6. TOMORROW PREVIEW — one sentence.
+
+Reference actual numbers. Be direct. Max ~{max_sentences} sentences total.
+Tone: {tone}. Units: {units}.
+"""
+
+    return _call_claude("daily_update", build_system_prompt(config), user_prompt, config, max_tokens=800)
+
+
+# ── Post-Workout Check-In ──────────────────────────────────────────────────────
+
+def post_workout_checkin(
+    activity_summary: str,
+    coach_notes: str,
+    athlete_profile: str,
+    garmin_formatted: str = "",
+    training_plan: str = "",
+    recent_logs: str = "",
+    weekly_reflection: str = "",
+) -> str:
+    """
+    Proactive check-in fired after a new workout is detected.
+    Uses the afternoon/evening check-in template — light, conversational, prompts for RPE/feel.
+    """
+    config = load_config()
+    claude_cfg = config["claude"]
+    tz_str = config["schedule"]["timezone"]
+    tone = claude_cfg["daily_update"]["tone"]
+    units = config["coaching"]["units"]
+    goal = config["coaching"]["goal"]
+
+    date_iso, weekday, time_str = get_local_datetime(tz_str)
+
+    body_state_block = garmin_formatted if garmin_formatted else "Not available."
+    plan_block = training_plan if training_plan else "Not available."
+    logs_block = recent_logs if recent_logs and recent_logs != "No daily logs yet." else "None yet."
+    reflection_block = weekly_reflection if weekly_reflection else "None yet."
+
+    user_prompt = f"""\
+=== DATE & CONTEXT ===
+{time_str} on {weekday}, {date_iso}
+Goal: {goal}
+
+=== ACTIVITY DETECTED ===
+{activity_summary}
+
+=== PLAN CONTEXT ===
+{plan_block}
+
+=== ATHLETE BODY STATE ===
+{body_state_block}
+
+=== RECENT TRAINING CONTEXT ===
+Recent daily logs + feedback:
+{logs_block}
+
+Last weekly reflection:
+{reflection_block}
+
+=== COACH CONTEXT ===
+Coach notes:
+{coach_notes}
+
+Athlete profile:
+{athlete_profile}
+
+=== INSTRUCTIONS ===
+Send a short post-workout check-in (2–3 sentences max):
+- Acknowledge the workout naturally — name the session type if you can infer it from the plan.
+- If the workout fits a pattern from recent logs (e.g. consistently running this session well or poorly), briefly note it.
+- Ask how it felt OR prompt for RPE if not yet logged. One question, not multiple.
+- If body battery or stress data suggests today was taxing, briefly note recovery tonight matters.
+- Do NOT give lap analysis or full coaching — that comes later. This is just a check-in.
+- Conversational and warm, not clinical.
+Tone: {tone}. Units: {units}.
+"""
+
+    return _call_claude("post_workout_checkin", build_system_prompt(config), user_prompt, config, max_tokens=300)
+
+
+# ── Nightly Evening Check-In ───────────────────────────────────────────────────
+
+def evening_checkin(
+    garmin_formatted: str,
+    training_plan: str,
+    coach_notes: str,
+    athlete_profile: str,
+    todays_feedback: str = "",
+    recent_logs: str = "",
+    weekly_reflection: str = "",
+    morning_summary: str = "",
+) -> str:
+    """
+    Scheduled nightly check-in. Reviews today's actual vs planned, gives execution
+    feedback, sets up tomorrow. Fires regardless of whether a workout happened.
+    """
+    config = load_config()
+    claude_cfg = config["claude"]
+    tz_str = config["schedule"]["timezone"]
+    tone = claude_cfg["daily_update"]["tone"]
+    units = config["coaching"]["units"]
+    goal = config["coaching"]["goal"]
+    load_trend_days = claude_cfg.get("load_trend_days", 14)
+    max_sentences = claude_cfg.get("evening_checkin", {}).get("max_sentences", 6)
+
+    date_iso, weekday, time_str = get_local_datetime(tz_str)
+
+    garmin_block = garmin_formatted if garmin_formatted else "Not available."
+    logs_block = recent_logs if recent_logs and recent_logs != "No daily logs yet." else "None yet."
+    reflection_block = weekly_reflection if weekly_reflection else "None yet."
+    feedback_block = todays_feedback if todays_feedback else "None logged today."
+    morning_block = morning_summary if morning_summary else "Not available."
+
+    user_prompt = f"""\
+=== TODAY ===
+{time_str} on {weekday}, {date_iso}
+Goal: {goal}
+
+=== TRAINING PLAN CONTEXT ===
+Training plan (extract today's planned session and tomorrow's session):
+{training_plan}
+
+=== TODAY'S GARMIN DATA (full) ===
+All recovery metrics (sleep, HRV, resting HR, body battery, stress, training readiness,
+training status, recovery time, ACWR, load focus) AND all activity data (distance, pace,
+HR, cadence, TSS, TE, lap splits, HR zones, running dynamics, weather context) are below.
+{load_trend_days}-day load trend and activity pattern are also included.
+{garmin_block}
+
+=== ATHLETE INPUT TODAY ===
+Logged feel/RPE/notes (from /felt, /rpe, /note commands or prior messages today):
+{feedback_block}
+
+This morning's coaching read:
+{morning_block}
+
+=== TRAINING CONTEXT ===
+Recent daily logs (last {load_trend_days} days):
+{logs_block}
+
+Last weekly reflection:
+{reflection_block}
+
+=== COACH CONTEXT ===
+Coach notes:
+{coach_notes}
+
+Athlete profile:
+{athlete_profile}
+
+=== INSTRUCTIONS ===
+Write the evening check-in. STRICT limit: {max_sentences} sentences maximum. Be conversational, not a report.
+
+- If they ran today: briefly assess execution in 1–2 sentences using the most important signal
+  (HR zone split, pace vs plan, HR drift, or weather-adjusted effort). Pick one thing, not all of them.
+
+- If no run but one was planned: acknowledge it in one sentence, ask what happened.
+
+- One sentence connecting today's body state to tomorrow (Training Status / Recovery Time if notable).
+
+- Close with one natural question about how the workout felt. The athlete replies directly — no commands needed.
+
+Max {max_sentences} sentences total. Tone: {tone}. Units: {units}.
+"""
+
+    return _call_claude("evening_checkin", build_system_prompt(config), user_prompt, config, max_tokens=600)
+
+
+# ── On-Demand Readiness Flash Check (/today) ──────────────────────────────────
+
+def today_readiness_check(
+    training_plan: str,
+    coach_notes: str,
+    athlete_profile: str,
+    garmin_formatted: str = "",
+    recent_logs: str = "",
+    weekly_reflection: str = "",
+) -> str:
+    """
+    Fast on-demand readiness verdict. GREEN / YELLOW / RED + one reason + modification if needed.
+    """
+    config = load_config()
+    claude_cfg = config["claude"]
+    tz_str = config["schedule"]["timezone"]
+    tone = claude_cfg["daily_update"]["tone"]
+    units = config["coaching"]["units"]
+    goal = config["coaching"]["goal"]
+    load_trend_days = claude_cfg.get("load_trend_days", 14)
+
+    date_iso, weekday, time_str = get_local_datetime(tz_str)
+
+    garmin_block = garmin_formatted if garmin_formatted else "Not available."
+    logs_block = recent_logs if recent_logs and recent_logs != "No daily logs yet." else "None."
+    reflection_block = weekly_reflection if weekly_reflection else "None yet."
+
+    user_prompt = f"""\
+=== DATE & PLAN ===
+{time_str} on {weekday}, {date_iso}
+Goal: {goal}
+
+Today's scheduled session (extract from plan):
+{training_plan}
+
+=== CURRENT STATE ===
+{garmin_block}
+
+=== RECENT HISTORY ===
+{load_trend_days}-day load trend is in the Garmin data above.
+Recent logs:
+{logs_block}
+
+Last weekly reflection:
+{reflection_block}
+
+=== CONTEXT ===
+Coach notes:
+{coach_notes}
+
+Athlete profile:
+{athlete_profile}
+
+=== INSTRUCTIONS ===
+Give a fast readiness verdict. Lead with exactly one of:
+  🟢 GREEN — go as planned
+  🟡 YELLOW — modify (say how: pace, distance, or swap to easy)
+  🔴 RED — rest or very easy only
+
+Then 2–3 sentences max. Reference the specific metric(s) driving the call:
+- HRV vs rolling average
+- Training Readiness score
+- Recovery Time remaining (hours) — if significant, name it
+- ACWR flag (optimal / elevated / high injury risk) — if elevated or above 1.5, that alone can push YELLOW/RED
+- Training Status (Overreaching / Recovering) — if present, factor it in
+Name just the top 1–2 signals. No preamble. No summary at the end. This is a glance-able answer.
+Tone: {tone}. Units: {units}.
+"""
+
+    return _call_claude("today_readiness_check", build_system_prompt(config), user_prompt, config, max_tokens=300)
+
+
+# ── Conversational Coach (free-text messages) ─────────────────────────────────
 
 def respond_to_user(
     user_message: str,
@@ -176,63 +541,80 @@ def respond_to_user(
     conversation_history: list[dict] | None = None,
     garmin_formatted: str = "",
     weekly_reflection: str = "",
+    recent_logs: str = "",
 ) -> str:
     config = load_config()
     claude_cfg = config["claude"]
     tz_str = config["schedule"]["timezone"]
+    tone = claude_cfg["daily_update"]["tone"]
+    units = config["coaching"]["units"]
+    goal = config["coaching"]["goal"]
+    load_trend_days = claude_cfg.get("load_trend_days", 14)
 
-    client = _get_client()
+    date_iso, weekday, time_str = get_local_datetime(tz_str)
 
-    garmin_section = (
-        f"GARMIN DATA (current):\n{garmin_formatted}\n\n"
-        if garmin_formatted
-        else ""
-    )
+    garmin_block = garmin_formatted if garmin_formatted else "Not available."
+    reflection_block = weekly_reflection if weekly_reflection else "None yet."
+    logs_block = recent_logs if recent_logs and recent_logs != "No daily logs yet." else "None yet."
 
-    reflection_section = (
-        f"WEEKLY REFLECTIONS (your own summaries):\n{weekly_reflection}\n\n"
-        if weekly_reflection
-        else ""
-    )
+    max_sentences = claude_cfg.get("respond", {}).get("max_sentences", 8)
 
-    context_prompt = (
-        f"Date: {get_local_date(tz_str)}\n\n"
-        f"{garmin_section}"
-        f"TRAINING PLAN:\n{training_plan}\n\n"
-        f"COACH NOTES:\n{coach_notes}\n\n"
-        f"ATHLETE PROFILE:\n{athlete_profile}\n\n"
-        f"{reflection_section}"
-        f"Respond as their coach. This is a text exchange — keep it conversational, not a report. "
-        f"When answering questions about readiness or effort, use the biometric data directly rather than speaking in generalities.\n\n"
-        f"If the athlete shares workout feedback (how it felt, RPE, effort level), acknowledge it and record it in <feedback_log>.\n"
-        f"If they mention a PR, injury, or significant schedule change, update the profile.\n"
-        f"Only add to coach notes if there's something genuinely worth flagging that isn't already in the data — most replies should leave notes unchanged.\n\n"
-        f"RESPONSE FORMAT:\n"
-        f"<coaching_message>Your reply here.</coaching_message>\n\n"
-        f"<updated_notes>Full updated coach_notes.md (existing + any new entries).</updated_notes>\n\n"
-        f"<updated_profile>Only if something permanent changed.</updated_profile>\n\n"
-        f"<feedback_log>Only if the athlete shared workout feedback, RPE, injury update, or notable result. "
-        f"One concise line, e.g. 'RPE 8 — tempo felt hard, heavy legs'.</feedback_log>"
-    )
+    context_prompt = f"""\
+=== ATHLETE CONTEXT ===
+{weekday}, {date_iso} at {time_str}
+Goal: {goal}
 
-    messages = [
+Recovery snapshot (sleep, HRV, body battery, RHR, stress, training readiness,
+training status, recovery time, ACWR, load focus, lactate threshold):
+{garmin_block}
+
+{load_trend_days}-day load trend, ACWR, and load focus distribution are in the Garmin data above.
+
+Training plan:
+{training_plan}
+
+Recent daily logs + feedback:
+{logs_block}
+
+Last weekly reflection:
+{reflection_block}
+
+Coach notes:
+{coach_notes}
+
+Athlete profile:
+{athlete_profile}
+
+=== INSTRUCTIONS ===
+You are their coach responding to a direct message. Rules:
+- Answer their actual question first. Be opinionated and specific — use their real numbers, not generic advice.
+- If they ask whether to do/skip/modify a session, give a clear recommendation with the reasoning.
+- If they share how something felt (RPE, effort, pain), acknowledge it and record it in <feedback_log>.
+- If they mention a PR, injury, or schedule change, note it in the profile or coach notes as appropriate.
+- Match their message's length and energy. Short question = short answer.
+- Pull from their data (HRV, splits, mileage, load trend) only when directly relevant.
+- STRICT limit: {max_sentences} sentences max. If their question is simple, use fewer.
+Tone: {tone}. Units: {units}.
+"""
+
+    prefix_messages = [
         {"role": "user", "content": context_prompt},
-        {"role": "assistant", "content": "Got it, I have your context loaded."},
+        {"role": "assistant", "content": "Got it — I have your full context loaded."},
     ]
-
     if conversation_history:
-        messages.extend(conversation_history)
+        prefix_messages.extend(conversation_history)
 
-    messages.append({"role": "user", "content": user_message})
-
-    message = client.messages.create(
-        model=claude_cfg["model"],
-        max_tokens=claude_cfg["max_tokens"],
-        system=build_system_prompt(config),
-        messages=messages,
+    return _call_claude(
+        "respond_to_user",
+        build_system_prompt(config),
+        user_message,
+        config,
+        max_tokens=600,
+        extra_messages=prefix_messages,
     )
-    return message.content[0].text
 
+
+# ── Weekly Report ──────────────────────────────────────────────────────────────
 
 def generate_weekly_reflection(
     garmin_formatted: str,
@@ -241,68 +623,83 @@ def generate_weekly_reflection(
     athlete_profile: str,
     recent_logs: str,
     week_label: str,
+    weekly_reflection: str = "",
 ) -> str:
     """
-    Generate a weekly reflection paragraph. Called Sunday evening.
-    Returns raw Claude response (parse coaching_message tag for the reflection text).
+    Sunday evening weekly report. Returns raw Claude response containing:
+      <athlete_summary>   — sent to Telegram
+      <coaching_message>  — saved to weekly_reflection.md as long-term memory
     """
     config = load_config()
     claude_cfg = config["claude"]
-    g_cfg = config["garmin"]
     tz_str = config["schedule"]["timezone"]
+    tone = claude_cfg["daily_update"]["tone"]
+    units = config["coaching"]["units"]
+    goal = config["coaching"]["goal"]
     load_trend_days = claude_cfg.get("load_trend_days", 14)
-    client = _get_client()
 
-    user_prompt = (
-        f"Date: {get_local_date(tz_str)} (end of {week_label})\n\n"
-        f"GARMIN DATA (last {g_cfg['lookback_days']} days):\n{garmin_formatted}\n\n"
-        f"TRAINING PLAN:\n{training_plan}\n\n"
-        f"COACH NOTES:\n{coach_notes}\n\n"
-        f"ATHLETE PROFILE:\n{athlete_profile}\n\n"
-        f"TRAINING HISTORY (last {load_trend_days} days):\n{recent_logs}\n\n"
-        f"Write a weekly reflection paragraph (3-5 sentences) covering: what the week's training theme was, "
-        f"how the athlete responded to load, the most important thing you observed (positive or negative), "
-        f"and what to carry into next week. Write it as a note to yourself — this will become part of your "
-        f"long-term memory and will be referenced in future daily updates. Be specific: cite actual workouts, "
-        f"metrics, and patterns. Start with the week label, e.g. '### {week_label}'.\n\n"
-        f"Use only <coaching_message> tags for your reflection. Do not include updated_notes or updated_profile."
-    )
+    date_iso, weekday, _ = get_local_datetime(tz_str)
 
-    message = client.messages.create(
-        model=claude_cfg["model"],
-        max_tokens=1000,
-        system=build_system_prompt(config),
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    return message.content[0].text
+    prior_reflections = weekly_reflection if weekly_reflection else "None yet."
 
+    user_prompt = f"""\
+=== WEEK ===
+{week_label} (reporting date: {weekday}, {date_iso})
+Goal: {goal}
 
-def post_workout_checkin(
-    activity_summary: str,
-    coach_notes: str,
-    athlete_profile: str,
-) -> str:
-    """
-    Generate a short proactive post-workout check-in message.
-    One or two sentences max — just acknowledge the workout and ask how it felt.
-    """
-    config = load_config()
-    claude_cfg = config["claude"]
-    client = _get_client()
+=== THIS WEEK'S GARMIN DATA (full) ===
+All activities with lap splits, HR zones, running dynamics, weather context,
+load distribution, activity pattern, ACWR, Training Status, Load Focus,
+sleep nightly breakdown + trend, HRV trajectory, body battery trend,
+stress patterns, resting HR trend, lactate threshold:
+{garmin_formatted}
 
-    user_prompt = (
-        f"COACH NOTES:\n{coach_notes}\n\n"
-        f"ATHLETE PROFILE:\n{athlete_profile}\n\n"
-        f"Recent activity detected:\n{activity_summary}\n\n"
-        f"Write a single short message (1-2 sentences) acknowledging the workout and asking how it felt. "
-        f"Don't give analysis yet — just check in. Be natural, not clinical. "
-        f"Use only <coaching_message> tags."
-    )
+=== ATHLETE INPUT ===
+Logged RPE, feel, notes, and any PRs this week (from daily logs):
+{recent_logs}
 
-    message = client.messages.create(
-        model=claude_cfg["model"],
-        max_tokens=200,
-        system=build_system_prompt(config),
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    return message.content[0].text
+=== CONTEXT ===
+Training plan (this week's prescribed sessions — treat as guideline):
+{training_plan}
+
+Prior weekly reflections (for pattern continuity):
+{prior_reflections}
+
+Athlete profile:
+{athlete_profile}
+
+Coach notes:
+{coach_notes}
+
+=== INSTRUCTIONS ===
+Produce two parts using these exact XML tags:
+
+<athlete_summary>
+What the athlete reads — 6–10 sentences:
+- What went well: specific sessions, consistency, pacing execution, recovery wins. Use numbers.
+- What needs work: missed sessions, sleep/HRV red flags, intensity distribution problems, execution issues.
+- If any respiration/SpO2 flags appeared this week, call them out — may indicate illness or accumulated fatigue.
+- HR zone distribution across the week's runs: was the effort profile appropriate for the training phase?
+  A developing runner should spend most time in Z1–Z2. Disproportionate Z3–Z5 = distribution flag.
+- Activity pattern (R/rest rhythm): note if rest days were present and appropriately spaced.
+- Training Status this week (Productive / Maintaining / Overreaching etc.) — what it means.
+- ACWR over the week: was the workload trend safe, elevated, or building risk?
+- Load Focus distribution: is the base/tempo/threshold/anaerobic split appropriate for the goal phase?
+- One clear focus for next week tied directly to the goal.
+- Honest and direct. Numbers over vibes.
+</athlete_summary>
+
+<coaching_message>
+### {week_label}
+Memory reflection — 3–5 sentences written for your future self, not the athlete:
+Compress the week into durable patterns: how their body responded to load (cite actual HRV/sleep numbers),
+what's trending (fitness, recovery, form), Training Status trajectory, ACWR direction, notable weather conditions
+if they affected effort interpretation, and what to watch coming week.
+Be specific: name the workouts, the metrics, the patterns.
+This will be referenced in future daily updates — make it useful.
+</coaching_message>
+
+Tone: {tone}. Units: {units}.
+"""
+
+    return _call_claude("generate_weekly_reflection", build_system_prompt(config), user_prompt, config, max_tokens=1500)

@@ -1,4 +1,4 @@
-# Marathon Training Plan
+# 5k Training Plan
 
 **Duration:** 19 weeks · June 15 – October 25
 

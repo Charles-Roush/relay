@@ -95,7 +95,7 @@ def read_recent_logs(n_days: int = 30) -> str:
     today = date.today()
     entries = []
 
-    for i in range(n_days, 0, -1):
+    for i in range(n_days, -1, -1):
         d = today - timedelta(days=i)
         path = _log_path(d)
         if not path.exists():

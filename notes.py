@@ -156,6 +156,12 @@ def append_feedback_note(text: str):
     write_notes("\n".join(lines) + "\n")
 
 
+def extract_tag(response: str, tag: str) -> str:
+    """Extract content from a named XML tag. Returns empty string if not found."""
+    match = re.search(rf'<{tag}>(.*?)</{tag}>', response, re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
 def parse_claude_response(response: str) -> tuple[str, str, str, str, str]:
     """
     Parse XML-tagged Claude response.
@@ -170,9 +176,14 @@ def parse_claude_response(response: str) -> tuple[str, str, str, str, str]:
 
     if msg_match:
         message = msg_match.group(1).strip()
+        # Strip any XML blocks Claude accidentally embedded inside the coaching message
+        message = re.sub(r'<(updated_notes|updated_profile|updated_plan|feedback_log|athlete_summary)>.*?</\1>', '', message, flags=re.DOTALL).strip()
     else:
-        # Fallback: strip all XML tags so raw tag markup never reaches Telegram
-        message = re.sub(r'<[^>]+>.*?</[^>]+>', '', response, flags=re.DOTALL).strip()
+        # Fallback: strip known coaching tags, then any remaining XML markup
+        message = response
+        for tag in ("updated_notes", "updated_profile", "updated_plan", "feedback_log", "athlete_summary"):
+            message = re.sub(rf'<{tag}>.*?</{tag}>', '', message, flags=re.DOTALL)
+        # Strip any remaining XML-style tags
         message = re.sub(r'<[^>]+>', '', message).strip()
     updated_notes = notes_match.group(1).strip() if notes_match else ""
     updated_profile = profile_match.group(1).strip() if profile_match else ""
