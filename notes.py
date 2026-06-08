@@ -168,7 +168,12 @@ def parse_claude_response(response: str) -> tuple[str, str, str, str, str]:
     plan_match = re.search(r'<updated_plan>(.*?)</updated_plan>', response, re.DOTALL)
     feedback_match = re.search(r'<feedback_log>(.*?)</feedback_log>', response, re.DOTALL)
 
-    message = msg_match.group(1).strip() if msg_match else response.strip()
+    if msg_match:
+        message = msg_match.group(1).strip()
+    else:
+        # Fallback: strip all XML tags so raw tag markup never reaches Telegram
+        message = re.sub(r'<[^>]+>.*?</[^>]+>', '', response, flags=re.DOTALL).strip()
+        message = re.sub(r'<[^>]+>', '', message).strip()
     updated_notes = notes_match.group(1).strip() if notes_match else ""
     updated_profile = profile_match.group(1).strip() if profile_match else ""
     updated_plan = plan_match.group(1).strip() if plan_match else ""

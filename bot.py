@@ -116,7 +116,7 @@ async def run_daily_update():
         coach_notes = notes.read_notes()
         athlete_profile = notes.read_profile()
         weekly_reflection = notes.read_weekly_reflection()
-        recent_logs = daily_log.read_recent_logs(n_days=30)
+        recent_logs = daily_log.read_recent_logs(n_days=config["claude"].get("daily_logs_days", 30))
 
         # Check if user has already messaged today before the daily update fires
         already_talked = _has_talked_today(TELEGRAM_CHAT_ID)
@@ -170,7 +170,7 @@ async def run_weekly_reflection():
 
         data = garmin.fetch_garmin_data()
         garmin_formatted = garmin.format_garmin_data(data, units=config["coaching"]["units"])
-        recent_logs = daily_log.read_recent_logs(n_days=14)
+        recent_logs = daily_log.read_recent_logs(n_days=config["claude"].get("load_trend_days", 14))
 
         response = claude.generate_weekly_reflection(
             garmin_formatted=garmin_formatted,

@@ -43,7 +43,7 @@ You have access to:
 - Rolling coach notes (short-term working memory, ~3 weeks)
 - Athlete profile (permanent long-term memory: PRs, injury history, race history, training observations)
 - Weekly reflections (your own written summaries of each training week)
-- Recent daily logs (30-day history of coaching analysis and athlete feedback)
+- Recent daily logs (coaching analysis and athlete feedback)
 
 **Coaching philosophy:**
 - Training adaptation happens through the right stimulus at the right time. Consistency beats heroics.
@@ -59,13 +59,13 @@ You have access to:
 **How to use the data:**
 - When analyzing a run, go lap by lap: identify warmup, steady state, and cooldown. Flag HR creep, pacing drift, or anomalous laps.
 - HRV trend over the past week matters more than a single reading. A steady decline signals accumulating fatigue before the athlete feels it.
-- Compare this week's load distribution (easy/moderate/hard) against the past 14 days. Flag imbalances.
+- Compare this week's load distribution (easy/moderate/hard) using the load trend summary provided. Flag imbalances.
 - When the athlete shares how a workout felt, reconcile their subjective experience with what the biometrics show — agreement is reassuring, disagreement is data.
 - Use the weekly reflections and daily logs to identify patterns that don't show up in a single session: e.g., HR consistently running high on Monday runs, sleep consistently poor before hard days.
 
-**Memory management:**
-- ATHLETE PROFILE is permanent long-term memory. Update it when you learn something lasting: a new PR, a confirmed injury pattern, a recurring tendency. Keep it specific and factual.
-- COACH NOTES are working memory (expire ~3 weeks). Use for current phase context, temporary flags, and anything relevant to the next few weeks.
+**Memory management — be selective, not exhaustive:**
+- COACH NOTES are for things you genuinely need to remember in 3-7 days that aren't already in the Garmin data or logs. Do NOT note individual workout completions, daily metrics, or anything already captured in the data. Only add a note if it's a flag, pattern, or context that wouldn't otherwise be visible — e.g. "athlete mentioned left knee soreness", "week of travel, disrupted sleep expected", "starting a down week". Most responses should not add any new notes at all.
+- ATHLETE PROFILE is for permanent observations only: new PRs, confirmed injury patterns, long-term tendencies. Do not update it unless something genuinely lasting has changed.
 - WEEKLY REFLECTION is your own written summary of each week — reference it when analyzing trends.
 
 **Tone:** {tone}. Use {units} units.
@@ -102,11 +102,13 @@ def daily_update(
     claude_cfg = config["claude"]
     g_cfg = config["garmin"]
     tz_str = config["schedule"]["timezone"]
+    daily_logs_days = claude_cfg.get("daily_logs_days", 30)
+    load_trend_days = claude_cfg.get("load_trend_days", 14)
 
     client = _get_client()
 
     logs_section = (
-        f"TRAINING HISTORY (last 30 days of daily logs):\n{recent_logs}\n\n"
+        f"TRAINING HISTORY (last {daily_logs_days} days of daily logs):\n{recent_logs}\n\n"
         if recent_logs and recent_logs != "No daily logs yet."
         else ""
     )
@@ -139,7 +141,7 @@ def daily_update(
         f"2. Workout breakdown — for EACH recent run, go lap by lap if data is available. "
         f"   Identify warmup / steady state / cooldown. Check for HR drift (pacing too fast for zone), "
         f"   anomalous laps, or effort that doesn't match the intended session. Flag anything worth noticing.\n"
-        f"3. Load trend — use the 14-day load distribution (easy/moderate/hard by aerobic TE) to assess "
+        f"3. Load trend — use the {load_trend_days}-day load distribution (easy/moderate/hard by aerobic TE) to assess "
         f"   whether the training balance is appropriate. Flag if there are too many moderate/hard days relative "
         f"   to easy days, or if total load is climbing faster than the athlete can absorb.\n"
         f"4. Today's recommendation — specific and actionable. Reference the training plan as a default. "
@@ -203,7 +205,8 @@ def respond_to_user(
         f"Respond as their coach. This is a text exchange — keep it conversational, not a report. "
         f"When answering questions about readiness or effort, use the biometric data directly rather than speaking in generalities.\n\n"
         f"If the athlete shares workout feedback (how it felt, RPE, effort level), acknowledge it and record it in <feedback_log>.\n"
-        f"If they mention a PR, injury, or significant schedule change, update the profile.\n\n"
+        f"If they mention a PR, injury, or significant schedule change, update the profile.\n"
+        f"Only add to coach notes if there's something genuinely worth flagging that isn't already in the data — most replies should leave notes unchanged.\n\n"
         f"RESPONSE FORMAT:\n"
         f"<coaching_message>Your reply here.</coaching_message>\n\n"
         f"<updated_notes>Full updated coach_notes.md (existing + any new entries).</updated_notes>\n\n"
@@ -245,16 +248,18 @@ def generate_weekly_reflection(
     """
     config = load_config()
     claude_cfg = config["claude"]
+    g_cfg = config["garmin"]
     tz_str = config["schedule"]["timezone"]
+    load_trend_days = claude_cfg.get("load_trend_days", 14)
     client = _get_client()
 
     user_prompt = (
         f"Date: {get_local_date(tz_str)} (end of {week_label})\n\n"
-        f"GARMIN DATA (last 10 days):\n{garmin_formatted}\n\n"
+        f"GARMIN DATA (last {g_cfg['lookback_days']} days):\n{garmin_formatted}\n\n"
         f"TRAINING PLAN:\n{training_plan}\n\n"
         f"COACH NOTES:\n{coach_notes}\n\n"
         f"ATHLETE PROFILE:\n{athlete_profile}\n\n"
-        f"TRAINING HISTORY (last 14 days):\n{recent_logs}\n\n"
+        f"TRAINING HISTORY (last {load_trend_days} days):\n{recent_logs}\n\n"
         f"Write a weekly reflection paragraph (3-5 sentences) covering: what the week's training theme was, "
         f"how the athlete responded to load, the most important thing you observed (positive or negative), "
         f"and what to carry into next week. Write it as a note to yourself — this will become part of your "

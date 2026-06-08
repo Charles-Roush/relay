@@ -27,6 +27,8 @@ claude:
   daily_update:
     max_sentences: 15        # Max length of morning summary
     tone: "direct"           # direct | encouraging | detailed
+  daily_logs_days: 30        # Days of training history logs to include in daily update
+  load_trend_days: 14        # Days used for easy/moderate/hard load trend analysis
   coach_notes:
     max_lines: 20            # Max notes to keep at once
     expiry_days: 21          # Auto-remove notes older than this

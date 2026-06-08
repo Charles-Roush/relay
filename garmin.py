@@ -255,14 +255,15 @@ def _classify_activity_load(aerobic_te: float | None) -> str:
 
 def _training_load_trend(activities: list[dict]) -> str:
     """
-    Summarise the last 14 days of training load as easy/moderate/hard counts
-    and total distance. Gives Claude a quick picture of load distribution.
+    Summarise recent training load as easy/moderate/hard counts and total distance.
+    Window is driven by load_trend_days from config. Gives Claude a quick picture of load distribution.
     """
     config = load_config()
     tz_str = config["schedule"]["timezone"]
     units = config["coaching"]["units"]
+    load_trend_days = config.get("claude", {}).get("load_trend_days", 14)
     today = get_local_date(tz_str)
-    cutoff = today - timedelta(days=14)
+    cutoff = today - timedelta(days=load_trend_days)
 
     easy = moderate = hard = unknown = 0
     total_meters = 0.0
@@ -290,7 +291,7 @@ def _training_load_trend(activities: list[dict]) -> str:
 
     total_runs = easy + moderate + hard + unknown
     if total_runs == 0:
-        return "No activity data for last 14 days."
+        return f"No activity data for last {load_trend_days} days."
 
     if units == "imperial":
         total_dist_str = f"{total_meters / 1609.34:.1f} mi"
@@ -301,7 +302,7 @@ def _training_load_trend(activities: list[dict]) -> str:
     if unknown:
         parts.append(f"unclassified={unknown}")
 
-    return f"Last 14 days: {total_runs} runs, {total_dist_str} total | Load distribution (by aerobic TE): {', '.join(parts)}"
+    return f"Last {load_trend_days} days: {total_runs} runs, {total_dist_str} total | Load distribution (by aerobic TE): {', '.join(parts)}"
 
 
 def _pace_str(avg_speed_ms: float | None, units: str) -> str:
