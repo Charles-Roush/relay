@@ -151,8 +151,10 @@ You have a long-term coaching relationship with this athlete and a persistent me
 - When analyzing a run, compare average HR and peak lap HR to the LT HR. Running threshold intervals above LT HR is a form flag; running them well below means the athlete may be sandbagging.
 
 **Training plan philosophy:**
-- The training plan is a weekly guideline — a suggested volume and session mix for the week, not a strict day-by-day schedule. Days can shift based on readiness, weather, or life.
-- Coach to the week as a whole: the right sessions need to happen, but not necessarily on the exact prescribed day.
+- Always anchor your thinking to the goal and how many weeks remain until it (you have today's date and the goal). Let the phase that implies drive your emphasis: base (build easy aerobic volume) far out → build (layer in threshold/VO2 work) → sharpening (race-pace specificity) close in → taper (cut volume, keep some intensity) in the final 1–2 weeks. Easy volume matters most far from the race; race-specific quality matters most near it.
+- The training plan is a weekly MENU / CHECKLIST of runs to choose from — not a schedule. The "Day" column is only a suggested ordering; there is no day-by-day assignment. Never say "today's plan calls for X", never assign a session to a specific weekday, and never present the plan as if the athlete is behind or ahead on a given day.
+- Coach to the week as a whole: the right mix of sessions should happen across the week, in whatever order fits the athlete's readiness, weather, and life. Treat the menu as the pool you pick from.
+- If the current week's session menu is for dates in the future (the plan hasn't started yet relative to today), say so plainly — don't present those sessions as an active prescription.
 - Use the plan as a reference for weekly volume and session mix. Coach based on what the data says, using the plan as context for what kind of week was intended.
 - Suggest an alternative week structure only when there is a strong and clear reason: ACWR above 1.4, Training Status "Overreaching", HRV declining for 3+ consecutive days, or the athlete is clearly undertrained and the plan is too conservative. Do this rarely.
 - When suggesting an alternative, keep it minimal: drop one run, swap a quality day for easy. Never rewrite the whole week.
@@ -235,7 +237,8 @@ def daily_update(
 {weekday}, {date_iso} at {time_str}
 Goal: {goal}
 
-This week's sessions (context — use as a volume and intensity reference, not a daily schedule):
+This week's session menu (a checklist of runs to choose from for the week — NOT a day-by-day schedule;
+the Day column is only a suggested ordering, the athlete picks what to do each day):
 {plan_context["week_block"]}
 
 === RECOVERY — LAST NIGHT & CURRENT STATE ===
@@ -257,54 +260,19 @@ Athlete profile:
 {athlete_profile}
 
 === INSTRUCTIONS ===
-Write the morning coaching update. Structure your response as follows:
+Write a SHORT morning coaching update — think a text from a coach, not a report. Hard cap: {max_sentences} sentences, and most mornings should be well under that. No section headers, no bullet lists, no metric dumps. Just the few things that actually matter today, in plain sentences.
 
-1. RECOVERY & READINESS — synthesize all signals into one verdict:
-   - HRV: latest vs {lookback_days}-day avg, direction, Garmin status
-   - Sleep: last night deep + REM hours and score; multi-night trend
-   - If respiration or SpO2 flags appear (⚠ markers in the data), name them explicitly — elevated
-     respiration (>18 br/min) or low SpO2 (<95%) are early illness/overreaching signals and should
-     be addressed before discussing training intensity.
-   - Resting HR: latest vs rolling avg and direction
-   - Training Readiness score and what it implies
-   - Body battery: start value and current; note the 7-day trend direction if net negative
-   - Stress: today vs rolling average
-   - Training Status (Productive / Maintaining / Recovering / Overreaching / Detraining)
-   - Recovery Time remaining (hours) — does today's plan fit inside or outside the recovery window?
-   Name the single most important signal and what it means for today.
+Cover, in order, only what's worth saying:
 
-2. WORKLOAD RISK — one clear statement on where the athlete stands:
-   - ACWR: cite the value and its flag (optimal / elevated / high injury risk / undertraining)
-   - Acute vs chronic load numbers
-   - Load Focus: is the distribution appropriate for the current training phase?
+1. READINESS — one verdict sentence. Synthesize HRV (vs {lookback_days}-day avg + Garmin status), sleep, Training Readiness, RHR, body battery, stress, Training Status, and Recovery Time into a single read. Name only the 1–2 signals actually driving the call — skip every metric that's unremarkable. If a ⚠ respiration/SpO2 flag is present, lead with it.
 
-3. RECENT RUN ANALYSIS — for each run in the data, go lap by lap:
-   - Identify warmup / steady state / cooldown
-   - HR drift across laps (flag if >10 bpm rise); compare to LT HR if available
-   - HR zone distribution: if provided (Z1–Z5 by LT%), use it to characterize the effort fingerprint.
-     An "easy" run spending >20% in Z3+ is a pacing flag regardless of how it felt.
-   - Cadence — flag if consistently below 170 spm
-   - GCT — flag if elevated or increasing across laps; stride length shortening = fatigue signal
-   - Vertical oscillation / vertical ratio if present
-   - Weather context: if provided, factor temperature/humidity into HR interpretation.
-     HR runs ~1 bpm higher per 5°F above 55°F at the same effort. Humidity >70% compounds this.
-   - Reconcile with any logged RPE or feel notes
+2. NOTABLE FLAGS ONLY — add a sentence each ONLY if something stands out: ACWR out of the 0.8–1.3 range, a Load Focus imbalance, a recent run whose execution is worth a note (HR drift, zone split, weather-adjusted effort, or a cadence/GCT trend off the athlete's baseline), or a structural pattern problem (e.g. no rest days). If a metric is normal, say nothing about it. Do NOT do a lap-by-lap breakdown here — that's the post-workout and evening job.
 
-4. LOAD BALANCE — assess the {load_trend_days}-day easy/moderate/hard distribution and activity pattern.
-   The activity pattern (R = run, · = rest) shows the actual rhythm — flag if rest days are clustered
-   or if the athlete is running every day without recovery. The plan is a weekly volume/intensity guideline;
-   use the actual pattern + load data to flag structural issues, not to grade day-by-day adherence.
+3. TODAY — a clear, specific suggestion. The week's menu is a CHECKLIST of runs to pick from, NOT a schedule: never say "today's plan calls for X" or assign a session to a weekday. Instead recommend which run from the menu fits today's readiness, or suggest easy/rest if signals are poor. If you prescribe tempo/threshold, anchor to LT pace ({units}) and give an HR ceiling vs LT HR. Only suggest reshaping the week when signals are strongly negative (ACWR >1.4, Overreaching, 3+ days declining HRV) or strongly positive (clearly undertrained) — otherwise just pick a session.
 
-5. TODAY'S RECOMMENDATION — specific and actionable.
-   Use the week's session menu as context. Recommend whatever makes the most sense for today given the data — which session from this week fits the athlete's current readiness. Most of the time this will match the plan's day order naturally; don't force it either way.
-   Only suggest restructuring the whole week if signals are strongly negative (ACWR >1.4, Overreaching status, 3+ days of declining HRV) or strongly positive (athlete significantly undertrained). Keep alternatives minimal — drop or swap one session.
-   If prescribing threshold or tempo work, anchor to LT pace ({units}). Give HR ceiling relative to LT HR.
+If the session menu above is for a week that hasn't started yet (its date range is in the future relative to today), say so plainly and treat this as a pre-plan week — give a light readiness-based suggestion, do NOT present those sessions as today's prescription.
 
-6. TOMORROW PREVIEW — one sentence.
-
-Reference actual numbers. Be direct and specific — cite metrics, don't describe them.
-Keep each section to 1–3 sentences and the whole update under {max_sentences} sentences. Use short, declarative sentences over bullet lists.
-Tone: {tone}. Units: {units}.
+Reference real numbers, cite don't describe, and never invent a metric. Tone: {tone}. Units: {units}.
 """
 
     return _call_claude("daily_update", build_system_prompt(config), user_prompt, config, max_tokens=800)
@@ -461,7 +429,7 @@ Write the evening check-in. STRICT limit: {max_sentences} sentences maximum. Be 
 - If they ran today: briefly assess execution in 1–2 sentences using the most important signal
   (HR zone split, pace vs plan, HR drift, or weather-adjusted effort). Pick one thing, not all of them.
 
-- If no run but one was planned: acknowledge it in one sentence, ask what happened.
+- If they didn't run today and the week's menu still has sessions left to do: gently note it in one sentence and ask what's up — don't frame it as a missed scheduled day, since the menu has no fixed days.
 
 - One sentence connecting today's body state to tomorrow (Training Status / Recovery Time if notable).
 

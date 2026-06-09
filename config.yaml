@@ -50,7 +50,7 @@ claude:
   model: "claude-sonnet-4-6"
   max_tokens: 4000
   daily_update:
-    max_sentences: 12            # Approximate length cap for morning update
+    max_sentences: 6            # Approximate length cap for morning update
     tone: "direct"               # direct | encouraging | detailed
   evening_checkin:
     max_sentences: 6             # Hard cap on evening check-in length
